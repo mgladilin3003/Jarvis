@@ -1,0 +1,14 @@
+services:
+  # Java Бот
+  jarvis-bot:
+    build: ./Jarvis-Java
+    container_name: jarvis-bot
+    environment:
+      - GO_AGENT_URL=http://go-agent:8081/api/v1/chat
+    restart: always
+
+  # Go Агент
+  go-agent:
+    build: ./Jarvis-Go
+    container_name: go-agent
+    restart: always

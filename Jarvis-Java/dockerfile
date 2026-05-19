@@ -1,0 +1,16 @@
+# Этап 1: Сборка (используем полноценный JDK)
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+RUN mvn clean package -DskipTests
+
+# Этап 2: Финальный образ (используем легкий JRE)
+FROM eclipse-temurin:21-jre-jammy
+WORKDIR /app
+COPY --from=build /app/target/*.jar app.jar
+
+# Указываем порт, на котором слушает Spring Boot (по умолчанию 8080)
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
