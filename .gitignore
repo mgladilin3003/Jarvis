@@ -1,0 +1,64 @@
+# --- ОСНОВНЫЕ ИГНОРИРУЕМЫЕ ФАЙЛЫ ---
+
+# Системные файлы (macOS, Windows, Linux)
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Среды разработки (VS Code, JetBrains, Sublime)
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.settings/
+.classpath
+
+# Секреты и конфигурации (КРИТИЧЕСКИ ВАЖНО)
+.env
+.env.*
+!.env.example
+
+# --- ПРОЕКТ JARVIS (Go + Java) ---
+
+# Go (компилируемые файлы и зависимости)
+bin/
+pkg/
+obj/
+*.exe
+*.test
+*.out
+*.so
+*.dylib
+*.dll
+vendor/
+
+# Java / Maven / Gradle
+target/
+build/
+.gradle/
+.gradle-cache/
+out/
+*.class
+*.jar
+*.war
+*.ear
+
+# Базы данных (НИКОГДА НЕ ПУШИ ЭТО)
+postgres_data/
+*.db
+*.sqlite
+*.log
+*.sql
+
+# Docker
+# (если ты не используешь Docker для деплоя всего окружения)
+docker-compose.override.yml
+
+# Временные файлы и логи
+*.log
+*.tmp
+*.bak
+*.swp

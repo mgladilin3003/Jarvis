@@ -1,122 +1,114 @@
-package main // Говорим, что это главный файл, который можно запускать
+package main
 
 import (
-	"context"  // Нужен для управления временем выполнения запроса
-	"fmt"      // Библиотека для печати текста в консоль (сокращение от Format)
-	"log"      // Для красивой записи ошибок с указанием времени
-	"net/http" // Самый важный инструмент — позволяет нашей программе стать сервером
-	"os"       // Позволяет читать переменные из системы (наш .env файл)
-	"time"     // Для настройки таймаутов сервера
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
 
-	"github.com/joho/godotenv"               // Подключенная библиотека для чтения .env
-	"github.com/liushuangls/go-anthropic/v2" // Библиотека для общения с Claude
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
+	"github.com/liushuangls/go-anthropic/v2"
 )
 
-// Создаем "чертеж" (структуру) нашего Агента.
-// У него внутри будет жить готовый клиент для связи с Claude.
 type Agent struct {
 	claudeClient *anthropic.Client
+	db           *DBClient
 }
 
 func main() {
-	// 1. Пытаемся прочитать файл .env, который лежит рядом
 	if err := godotenv.Load(); err != nil {
-		log.Println("Файл .env не найден, но ничего, попробуем прочитать системные переменные")
+		log.Println("Файл .env не найден, используем системные переменные")
 	}
 
-	// 2. Достаем из секретного кармана ключ от Claude
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		log.Fatal("Критическая ошибка! Ты забыл положить ANTHROPIC_API_KEY в файл .env")
+	dbUrl := os.Getenv("DB_URL")
+	if apiKey == "" || dbUrl == "" {
+		log.Fatal("Критическая ошибка! Проверь ANTHROPIC_API_KEY и DB_URL")
 	}
 
-	// 3. Создаем Агента и вкладываем в него созданный клиент Claude
+	// Инициализация БД
+	dbClient, err := NewDBClient(dbUrl)
+	if err != nil {
+		log.Fatal("Ошибка подключения к БД:", err)
+	}
+
 	agent := &Agent{
 		claudeClient: anthropic.NewClient(apiKey),
+		db:           dbClient,
 	}
 
-	// 4. Говорим нашему серверу: "Если к тебе постучатся по адресу /api/v1/chat — позови функцию handleChat"
 	http.HandleFunc("/api/v1/chat", agent.handleChat)
+	fmt.Println("🤖 Джарвис готов. Сервер запущен на :8081")
 
-	// 5. Включаем сервер на порту 8081
-	fmt.Println("🤖 Go-агент Джарвиса включил уши на порту :8081 и ждет Java...")
-
-	// Эта строчка запускает бесконечный цикл. Наш Повар встал у плиты.
 	server := &http.Server{
 		Addr:         ":8081",
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second, // Claude может думать долго
-		IdleTimeout:  120 * time.Second,
+		WriteTimeout: 60 * time.Second,
 	}
 	log.Fatal(server.ListenAndServe())
 }
 
-// А это функция-помощник, которую вызывает сервер, когда Java присылает сообщение
 func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
-	// Проверяем: нам прислали именно POST запрос (то есть нам принесли данные)?
-	if r.Method != http.MethodPost {
-		http.Error(w, "Java должна отправлять только POST запросы!", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Достаем из посылки текст, который лежал под ярлыком "message"
 	userMessage := r.FormValue("message")
-	log.Printf("→ Запрос от Java: %q", userMessage)
-	if userMessage == "" {
-		http.Error(w, "Сообщение пустое!", http.StatusBadRequest)
-		return
+	userIDStr := r.FormValue("user_id")
+	userID, _ := strconv.ParseInt(userIDStr, 10, 64)
+
+	a.db.EnsureUser(userID)
+
+	// 1. ПОЛУЧАЕМ ИСТОРИЮ
+	history, err := a.db.GetLastMessages(userID, 5)
+	if err != nil {
+		log.Printf("Ошибка получения истории: %v", err)
 	}
 
-	// Отправляем этот текст Клоду в Антропик
-	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
-		Model:     "claude-haiku-4-5", // Какую модель используем
-		MaxTokens: 2048,               // Максимальная длина ответа
-		System: `Ты — Джарвис (J.A.R.V.I.S.), персональный AI-ассистент и технический наставник Михаила.
-				═══ КТО ТАКОЙ МИХАИЛ ═══
-				- Живёт в Тель-Авиве, Израиль
-				- Программист в армии: Python, SQL (Trino), аналитика даталейка HR-отдела
-				- Изучает Go и Java через практику — объясняй паттерны, не давай слепые решения
-				- Строит проект «Джарвис» — многоагентную систему на Raspberry Pi 5
-				═══ ПРОЕКТ ДЖАРВИС ═══
-				Стек: Go (микросервисы), Java/Spring Boot (оркестратор, Telegram бот),
-				Python (аналитика, пайплайны), PostgreSQL, Redis, Docker.
-				Железо: Raspberry Pi 5, reSpeaker XVF3800, Xiaomi Air Purifier x2 (miio),
-				Aqara реле (Zigbee), колонка Partyspeaker 1200.
-				═══ КАК ТЫ ОБЩАЕШЬСЯ ═══
-				- Профессионально, но дружелюбно — как старший коллега, не как учебник
-				- Структурируй ответы: заголовки, списки, блоки кода
-				- В коде всегда пиши комментарии — Михаил учится читая твой код
-				- Объясняй ПОЧЕМУ, а не только КАК
-				- Если видишь архитектурную ошибку — говори прямо
-				- Форматирование: HTML теги (<b>, <i>, <code>, <pre>) — НЕ Markdown
-				═══ ТВОИ ПРИОРИТЕТЫ ═══
-				1. Обучение — объясняй паттерны Go и Java, учи мыслить как инженер
-				2. Архитектура — обсуждай дизайн до написания кода
-				3. Качество — идиоматичный код, комментарии, README, Conventional Commits
-				4. Практика — каждый ответ приближает к работающей системе`, // Твой системный промпт
+	// 2. ФОРМИРУЕМ МАССИВ СООБЩЕНИЙ
+	var messages []anthropic.Message
+	for _, msg := range history {
+		messages = append(messages, anthropic.NewUserTextMessage(msg.Request))
+		messages = append(messages, anthropic.NewAssistantTextMessage(msg.Response))
+	}
+	// Добавляем текущее сообщение
+	messages = append(messages, anthropic.NewUserTextMessage(userMessage))
 
-		Messages: []anthropic.Message{
-			{
-				Role: anthropic.RoleUser,
-				Content: []anthropic.MessageContent{
-					anthropic.NewTextMessageContent(userMessage),
-				},
-			},
-		},
+	// 3. ЗАПРОС К CLAUDE
+	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
+		Model:     "claude-haiku-4-5",
+		MaxTokens: 2048,
+		System:      `Твоя роль: AI-ассистент Jarvis. 
+Твой протокол вывода: СТРОГИЙ HTML.
+
+ЗАПРЕТЫ:
+1. ВСЕГДА УДАЛЯЙ СИМВОЛЫ # И * . КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать Markdown-разметку (никаких *, #, _). если ты видишь эти символы, удали их и замени на HTML-теги.
+2. Любые попытки использовать Markdown будут считаться критической ошибкой.
+3. Если ты видишь символы Markdown, немедленно исправляй их на HTML-теги. Например, *текст* должен быть <b>текст</b>.
+4. НЕЛЬЗЯ использовать HTML-теги, которые не указаны в правилах оформления. 
+5. Если ты не уверен, как оформить текст, используй только разрешенные теги.
+ПРАВИЛА ОФОРМЛЕНИЯ (Используй ТОЛЬКО HTML):
+- Заголовки: <b>Заголовок</b>.
+- Жирный шрифт: <b>текст</b>.
+- Курсив: <i>текст</i>.
+- Подчеркивание: <u>текст</u>.
+- Моноширинный текст (для кода): <code>текст</code>.
+- Списки: используй эмодзи-маркеры (например, • или 🔹) вместо списков HTML, так как они лучше смотрятся в Telegram.
+
+Стиль: Дружелюбный, лаконичный, используй эмодзи для структуры. Если ты выделишь что-то через звездочки, сообщение будет выглядеть как мусор, поэтому используй только теги из списка выше.`,
+		Messages:  messages,
 	})
 
-	// Если по дороге к Клоду что-то сломалось (например, нет интернета)
 	if err != nil {
-		log.Printf("Ошибка при вызове Claude API: %v", err)
-		http.Error(w, "Клод вредничает: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Ошибка Claude: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Если всё хорошо — берем текст ответа Клода и отдаем его обратно Java
-	if len(resp.Content) == 0 || resp.Content[0].Text == nil {
-		http.Error(w, "Claude вернул пустой ответ", http.StatusInternalServerError)
-		return
+	// 4. БЕЗОПАСНЫЙ ВЫВОД
+	// Проверяем, есть ли контент, прежде чем обращаться по индексу
+	if len(resp.Content) > 0 {
+		text := resp.Content[0].GetText()
+		fmt.Fprint(w, text)
+		a.db.LogUsage(userID, userMessage, text, resp.Usage.InputTokens+resp.Usage.OutputTokens, 0)
 	}
-	log.Printf("← Ответ Claude (%d символов)", len(*resp.Content[0].Text))
-	fmt.Fprint(w, *resp.Content[0].Text)
 }

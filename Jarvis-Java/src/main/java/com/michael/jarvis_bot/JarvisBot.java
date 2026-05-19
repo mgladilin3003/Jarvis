@@ -3,7 +3,6 @@ package com.michael.jarvis_bot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedMultiValueMap;
@@ -24,24 +23,20 @@ public class JarvisBot extends TelegramLongPollingBot {
     private final String botUsername;
     private final RestTemplate restTemplate;
 
-    // Выносим URL в настройки
     @Value("${go.agent.url}")
     private String goAgentUrl;
 
-    @Bean
-    public RestTemplate restTemplate() {
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(5_000); // 5 сек на соединение
-        factory.setReadTimeout(60_000);   // 60 сек на ответ
-        return new RestTemplate(factory);
-    }
-
+    // ВНИМАНИЕ: Здесь больше нет @Bean, мы создаем объект вручную в конструкторе
     public JarvisBot(@Value("${bot.name}") String botUsername, 
-                     @Value("${bot.token}") String botToken,
-                     RestTemplate restTemplate) {
+                     @Value("${bot.token}") String botToken) {
         super(botToken);
         this.botUsername = botUsername;
-        this.restTemplate = restTemplate;
+        
+        // Создаем RestTemplate здесь, без участия Spring-контейнера
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(5_000);
+        factory.setReadTimeout(60_000);
+        this.restTemplate = new RestTemplate(factory);
     }
 
     @Override
@@ -70,6 +65,7 @@ public class JarvisBot extends TelegramLongPollingBot {
             
             MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
             body.add("message", messageFromUser);
+            body.add("user_id", String.valueOf(chatId));
 
             try {
                 String responseFromClaude = restTemplate.postForObject(goAgentUrl, body, String.class);
