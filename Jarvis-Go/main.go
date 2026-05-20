@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,7 +17,12 @@ import (
 
 type Agent struct {
 	claudeClient *anthropic.Client
-	db           *DBClient
+	db           *sql.DB
+}
+
+type ChatMessage struct {
+	Role    string
+	Content string
 }
 
 func main() {
@@ -30,19 +36,25 @@ func main() {
 		log.Fatal("Критическая ошибка! Проверь ANTHROPIC_API_KEY и DB_URL")
 	}
 
-	// Инициализация БД
-	dbClient, err := NewDBClient(dbUrl)
+	// Инициализация стандартного драйвера sql
+	db, err := sql.Open("postgres", dbUrl)
 	if err != nil {
 		log.Fatal("Ошибка подключения к БД:", err)
+	}
+	defer db.Close()
+
+	// Проверка соединения
+	if err := db.Ping(); err != nil {
+		log.Fatal("База данных недоступна:", err)
 	}
 
 	agent := &Agent{
 		claudeClient: anthropic.NewClient(apiKey),
-		db:           dbClient,
+		db:           db,
 	}
 
 	http.HandleFunc("/api/v1/chat", agent.handleChat)
-	fmt.Println("🤖 Джарвис готов. Сервер запущен на :8081")
+	fmt.Println("🤖 Джарвис (Stateless) готов. Сервер на :8081")
 
 	server := &http.Server{
 		Addr:         ":8081",
@@ -54,61 +66,98 @@ func main() {
 
 func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	userMessage := r.FormValue("message")
-	userIDStr := r.FormValue("user_id")
-	userID, _ := strconv.ParseInt(userIDStr, 10, 64)
+	telegramIDStr := r.FormValue("user_id")
+	telegramID, _ := strconv.ParseInt(telegramIDStr, 10, 64)
 
-	a.db.EnsureUser(userID)
+	// 1. ПОЛУЧАЕМ ВНУТРЕННИЙ ID ПОЛЬЗОВАТЕЛЯ
+	var userID int
+	err := a.db.QueryRow("SELECT id FROM users WHERE telegram_id = $1", telegramID).Scan(&userID)
+	if err != nil {
+		// Если пользователя нет, Java-бот должен был его создать. Но на всякий случай:
+		log.Printf("Пользователь %d не найден в базе", telegramID)
+		http.Error(w, "User not found", http.StatusForbidden)
+		return
+	}
 
-	// 1. ПОЛУЧАЕМ ИСТОРИЮ
-	history, err := a.db.GetLastMessages(userID, 5)
+	// 2. СОХРАНЯЕМ ВХОДЯЩЕЕ СООБЩЕНИЕ
+	_, err = a.db.Exec("INSERT INTO messages (user_id, role, content) VALUES ($1, 'user', $2)", userID, userMessage)
+	if err != nil {
+		log.Printf("Ошибка записи сообщения пользователя: %v", err)
+	}
+
+	// 3. ПОЛУЧАЕМ ИСТОРИЮ (последние 10 сообщений)
+	history, err := a.getHistory(userID)
 	if err != nil {
 		log.Printf("Ошибка получения истории: %v", err)
 	}
 
-	// 2. ФОРМИРУЕМ МАССИВ СООБЩЕНИЙ
+	// 4. ФОРМИРУЕМ МАССИВ ДЛЯ CLAUDE
 	var messages []anthropic.Message
 	for _, msg := range history {
-		messages = append(messages, anthropic.NewUserTextMessage(msg.Request))
-		messages = append(messages, anthropic.NewAssistantTextMessage(msg.Response))
+		role := anthropic.RoleUser
+		if msg.Role == "assistant" {
+			role = anthropic.RoleAssistant
+		}
+		messages = append(messages, anthropic.Message{
+			Role:    role,
+			Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(msg.Content)},
+		})
 	}
-	// Добавляем текущее сообщение
-	messages = append(messages, anthropic.NewUserTextMessage(userMessage))
 
-	// 3. ЗАПРОС К CLAUDE
+	// 5. ЗАПРОС К CLAUDE
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
-		Model:     "claude-haiku-4-5",
+		Model:     "claude-haiku-4-5", // Исправлено на актуальную модель
 		MaxTokens: 2048,
-		System:      `Твоя роль: AI-ассистент Jarvis. 
+		System: `Твоя роль: AI-ассистент Jarvis. 
 Твой протокол вывода: СТРОГИЙ HTML.
-
 ЗАПРЕТЫ:
-1. ВСЕГДА УДАЛЯЙ СИМВОЛЫ # И * . КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать Markdown-разметку (никаких *, #, _). если ты видишь эти символы, удали их и замени на HTML-теги.
-2. Любые попытки использовать Markdown будут считаться критической ошибкой.
-3. Если ты видишь символы Markdown, немедленно исправляй их на HTML-теги. Например, *текст* должен быть <b>текст</b>.
-4. НЕЛЬЗЯ использовать HTML-теги, которые не указаны в правилах оформления. 
-5. Если ты не уверен, как оформить текст, используй только разрешенные теги.
-ПРАВИЛА ОФОРМЛЕНИЯ (Используй ТОЛЬКО HTML):
-- Заголовки: <b>Заголовок</b>.
-- Жирный шрифт: <b>текст</b>.
-- Курсив: <i>текст</i>.
-- Подчеркивание: <u>текст</u>.
-- Моноширинный текст (для кода): <code>текст</code>.
-- Списки: используй эмодзи-маркеры (например, • или 🔹) вместо списков HTML, так как они лучше смотрятся в Telegram.
-
-Стиль: Дружелюбный, лаконичный, используй эмодзи для структуры. Если ты выделишь что-то через звездочки, сообщение будет выглядеть как мусор, поэтому используй только теги из списка выше.`,
-		Messages:  messages,
+1. ВСЕГДА УДАЛЯЙ СИМВОЛЫ # И * . КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать Markdown-разметку.
+2. Используй ТОЛЬКО HTML-теги: <b>, <i>, <u>, <code>.
+3. Списки оформляй через эмодзи (• или 🔹).`,
+		Messages: messages,
 	})
 
 	if err != nil {
+		log.Printf("Ошибка Claude: %v", err)
 		http.Error(w, "Ошибка Claude: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// 4. БЕЗОПАСНЫЙ ВЫВОД
-	// Проверяем, есть ли контент, прежде чем обращаться по индексу
+	// 6. ОБРАБОТКА ОТВЕТА И СОХРАНЕНИЕ
 	if len(resp.Content) > 0 {
-		text := resp.Content[0].GetText()
-		fmt.Fprint(w, text)
-		a.db.LogUsage(userID, userMessage, text, resp.Usage.InputTokens+resp.Usage.OutputTokens, 0)
+		responseText := resp.Content[0].GetText()
+
+		// Сохраняем ответ ассистента в базу
+		_, err = a.db.Exec("INSERT INTO messages (user_id, role, content, tokens_used) VALUES ($1, 'assistant', $2, $3)",
+			userID, responseText, resp.Usage.InputTokens+resp.Usage.OutputTokens)
+		if err != nil {
+			log.Printf("Ошибка записи ответа ассистента: %v", err)
+		}
+
+		fmt.Fprint(w, responseText)
 	}
+}
+
+func (a *Agent) getHistory(userID int) ([]ChatMessage, error) {
+	rows, err := a.db.Query(`
+		SELECT role, content 
+		FROM messages 
+		WHERE user_id = $1 
+		ORDER BY created_at DESC 
+		LIMIT 10`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []ChatMessage
+	for rows.Next() {
+		var m ChatMessage
+		if err := rows.Scan(&m.Role, &m.Content); err != nil {
+			return nil, err
+		}
+		// Разворачиваем историю в правильном порядке (от старых к новым)
+		history = append([]ChatMessage{m}, history...)
+	}
+	return history, nil
 }
