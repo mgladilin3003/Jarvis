@@ -51,7 +51,6 @@ postgres_data/
 *.db
 *.sqlite
 *.log
-*.sql
 
 # Docker
 # (если ты не используешь Docker для деплоя всего окружения)
