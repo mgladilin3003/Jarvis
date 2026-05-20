@@ -7,6 +7,6 @@ go:
 spring:
   datasource:
     url: jdbc:postgresql://postgres-db:5432/jarvis
-    username: user
-    password: pass
+    username: jarvis_user
+    password: secret_password
     driver-class-name: org.postgresql.Driver
