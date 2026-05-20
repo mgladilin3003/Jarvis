@@ -6,7 +6,7 @@ go:
     url: http://go-agent:8081/api/v1/chat
 spring:
   datasource:
-    url: jdbc:postgresql://postgres-db:5432/jarvis
+    url: jdbc:postgresql://postgres-db:5432/jarvis_db
     username: jarvis_user
     password: secret_password
     driver-class-name: org.postgresql.Driver
