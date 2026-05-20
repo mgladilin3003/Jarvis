@@ -4,11 +4,9 @@ bot:
 go:
   agent:
     url: http://go-agent:8081/api/v1/chat
-# Параметры подключения к БД
-spring.datasource.url=jdbc:postgresql://postgres-db:5432/jarvis
-spring.datasource.username=user
-spring.datasource.password=pass
-spring.datasource.driver-class-name=org.postgresql.Driver
-
-# Чтобы Spring не падал, если база еще не поднялась
-spring.datasource.hikari.initialization-fail-timeout=0
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres-db:5432/jarvis
+    username: user
+    password: pass
+    driver-class-name: org.postgresql.Driver
