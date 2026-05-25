@@ -46,6 +46,8 @@ func main() {
 
 	agent := &Agent{claudeClient: anthropic.NewClient(apiKey), db: db}
 	http.HandleFunc("/api/v1/chat", agent.handleChat)
+	http.HandleFunc("/api/v1/analyze_file", agent.handleAnalyzeFile)
+
 	fmt.Println("🤖 Джарвис готов. Порт :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
 }
