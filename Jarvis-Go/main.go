@@ -52,94 +52,70 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	uid := r.FormValue("user_id")
 	sid := r.FormValue("session_id")
 
-	// 0. ПОЛУЧАЕМ ИСТОРИЮ ДИАЛОГА (Контекст)
 	chatHistory := a.getChatHistory(uid, sid)
-
-	// 1. Запись текущего сообщения пользователя
-	var userMessageID int64
-	err := a.db.QueryRow("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3) RETURNING id",
-		uid, sid, msg).Scan(&userMessageID)
-	if err != nil {
-		log.Printf("❌ Ошибка записи сообщения: %v", err)
-	}
-
-	memCount := a.getMemCount(uid)
 	memories := a.getMemories(uid)
+	memCount := a.getMemCount(uid)
+
+	var sessionMsgCount int
+	a.db.QueryRow("SELECT COUNT(*) FROM messages WHERE session_id = $1 AND role = 'user'", sid).Scan(&sessionMsgCount)
+
+	var userMessageID int64
+	a.db.QueryRow("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3) RETURNING id",
+		uid, sid, msg).Scan(&userMessageID)
 
 	var systemPrompt string
 	if memCount < len(regQuestions) {
-		var questionsStr string
-		for i, q := range regQuestions {
-			questionsStr += fmt.Sprintf("%d. %s\n", i+1, q)
-		}
-
-		systemPrompt = fmt.Sprintf(`Ты Джарвис, цифровой бро. Идет регистрация.
-        
-История текущего диалога (для понимания контекста):
-%s
-
-Список вопросов для регистрации:
-%s
-
-База известных фактов: [%s]
-
-ЖЕСТКИЕ ПРАВИЛА:
-1. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать Markdown (**звездочки**). Это ломает бота! Для выделения эмоций используй ЭМОДЗИ (🚀😎🔥) или ЗАГЛАВНЫЕ БУКВЫ.
-2. НЕ ЗДОРОВАЙСЯ в каждом сообщении. Поздоровался один раз — и хватит.
-3. НЕ ПОВТОРЯЙ факты о пользователе (имя, хобби), если это не нужно прямо сейчас. Общайся естественно.
-4. Отреагируй на ответ пользователя и СРАЗУ (в этом же сообщении) задай следующий вопрос из списка. Вопрос копируй СЛОВО В СЛОВО без отсебятины.
-5. Если получена новая инфа о пользователе, в самом конце добавь разделитель ---JSON--- и JSON: {"key":"...","value":"...","cat":"profile"}.`, chatHistory, questionsStr, memories)
-
+		systemPrompt = fmt.Sprintf(`Ты Джарвис. Регистрация. 
+		Вопросы: %s
+		Известно: [%s]
+		ПРАВИЛА:
+		1. ИСПОЛЬЗУЙ HTML: <b>жирный</b>, <u>подчеркнутый</u>. НИКАКИХ ЗВЕЗДОЧЕК (**).
+		2. НЕ ЗДОРОВАЙСЯ постоянно.
+		3. Отреагируй и задай СЛЕДУЮЩИЙ ВОПРОС из списка слово в слово.
+		4. В конце: ---JSON--- {"key":"...","value":"...","cat":"profile","title":"Знакомство"}`,
+			strings.Join(regQuestions, "\n"), memories)
+	} else if sessionMsgCount <= 1 {
+		systemPrompt = fmt.Sprintf(`Ты Джарвис. Пользователь: [%s]. Начало нового чата.
+		ПРАВИЛА:
+		1. Поприветствуй по имени (используй <b></b>). 
+		2. Спроси про тон (дружеский/серьезный) и цель чата.
+		3. Используй ЭМОДЗИ и HTML (<b>, <u>). НИКАКИХ ЗВЕЗДОЧЕК.
+		4. В конце: ---JSON--- {"title": "Тема чата"}`, memories)
 	} else {
-		systemPrompt = fmt.Sprintf(`Ты Джарвис, цифровой напарник. 
-
-История текущего диалога (память):
-%s
-
-База известных фактов: [%s]
-
-ЖЕСТКИЕ ПРАВИЛА:
-1. НИКАКИХ ЗВЕЗДОЧЕК (**) и Markdown-разметки! Используй только текст, ЗАГЛАВНЫЕ БУКВЫ и ЭМОДЗИ (😎🤖💡).
-2. Не здоровайся в каждом сообщении. Мы уже общаемся.
-3. Упоминай факты о пользователе только если это уместно в контексте беседы. Не веди себя как робот-автоответчик.`, chatHistory, memories)
+		systemPrompt = fmt.Sprintf(`Ты Джарвис. Память: [%s]. Контекст: %s.
+		ПРАВИЛА:
+		1. Общайся по делу, используй HTML. БЕЗ ЗВЕЗДОЧЕК.
+		2. Если сменили тему, обнови title: ---JSON--- {"title": "Новая тема"}`, memories, chatHistory)
 	}
 
-	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
+	resp, _ := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
 		Model:     anthropic.Model("claude-haiku-4-5"),
-		MaxTokens: 2048,
+		MaxTokens: 1024,
 		System:    systemPrompt,
 		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(msg)}}},
 	})
-
-	if err != nil {
-		log.Printf("❌ API Error: %v", err)
-		http.Error(w, "Claude error", 500)
-		return
-	}
 
 	if userMessageID != 0 {
 		a.db.Exec("UPDATE messages SET tokens_used = $1 WHERE id = $2", resp.Usage.InputTokens, userMessageID)
 	}
 
 	fullText := resp.Content[0].GetText()
+	cleanText := fullText
 
-	var cleanText string
 	if strings.Contains(fullText, "---JSON---") {
 		parts := strings.Split(fullText, "---JSON---")
 		cleanText = parts[0]
-
-		jsonPart := parts[1]
-		s := strings.Index(jsonPart, "{")
-		e := strings.LastIndex(jsonPart, "}")
-		if s != -1 && e != -1 && e >= s {
-			match := jsonPart[s : e+1]
-			var m map[string]string
-			if err := json.Unmarshal([]byte(match), &m); err == nil {
-				a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, m["key"], m["value"], m["cat"])
+		var m map[string]string
+		re := regexp.MustCompile(`\{.*\}`)
+		if err := json.Unmarshal([]byte(re.FindString(parts[1])), &m); err == nil {
+			if key, ok := m["key"]; ok && key != "" {
+				a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, key, m["value"], m["cat"])
+			}
+			if title, ok := m["title"]; ok && title != "" {
+				// Исправлено под твою таблицу (sessions -> title)
+				a.db.Exec("UPDATE sessions SET title = $1 WHERE id = $2", title, sid)
 			}
 		}
-	} else {
-		cleanText = fullText
 	}
 
 	finalText := a.cleanTrash(cleanText)
@@ -150,45 +126,9 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(AgentResponse{Text: finalText, Model: "claude-haiku-4-5"})
 }
 
-// Достаем последние 10 сообщений, чтобы Джарвис понимал контекст
-func (a *Agent) getChatHistory(uid, sid string) string {
-	rows, err := a.db.Query(`
-		SELECT role, content FROM (
-			SELECT id, role, content FROM messages 
-			WHERE user_id = $1 AND session_id = $2 
-			ORDER BY id DESC LIMIT 10
-		) sub ORDER BY id ASC
-	`, uid, sid)
-	if err != nil {
-		return ""
-	}
-	defer rows.Close()
-
-	var sb strings.Builder
-	for rows.Next() {
-		var role, content string
-		rows.Scan(&role, &content)
-		if role == "user" {
-			sb.WriteString("User: " + content + "\n")
-		} else {
-			sb.WriteString("Jarvis: " + content + "\n")
-		}
-	}
-	return sb.String()
-}
-
 func (a *Agent) cleanTrash(text string) string {
-	reTags := regexp.MustCompile(`(?i)\[JSON\].*?\[/JSON\]`)
-	text = reTags.ReplaceAllString(text, "")
 	text = strings.ReplaceAll(text, "---JSON---", "")
-
-	// Вырезаем маркдаун
 	text = strings.ReplaceAll(text, "**", "")
-	text = strings.ReplaceAll(text, "*", "")
-	text = strings.ReplaceAll(text, "###", "")
-	text = strings.ReplaceAll(text, "##", "")
-	text = strings.ReplaceAll(text, "#", "")
-
 	return strings.TrimSpace(text)
 }
 
@@ -201,10 +141,21 @@ func (a *Agent) getMemCount(uid string) int {
 func (a *Agent) getMemories(uid string) string {
 	rows, _ := a.db.Query("SELECT fact_key, fact_value FROM memories WHERE user_id = $1", uid)
 	var sb strings.Builder
-	for rows.Next() {
+	for rows != nil && rows.Next() {
 		var k, v string
 		rows.Scan(&k, &v)
 		sb.WriteString(k + ": " + v + "; ")
+	}
+	return sb.String()
+}
+
+func (a *Agent) getChatHistory(uid, sid string) string {
+	rows, _ := a.db.Query(`SELECT role, content FROM (SELECT id, role, content FROM messages WHERE user_id = $1 AND session_id = $2 ORDER BY id DESC LIMIT 6) sub ORDER BY id ASC`, uid, sid)
+	var sb strings.Builder
+	for rows != nil && rows.Next() {
+		var r, c string
+		rows.Scan(&r, &c)
+		sb.WriteString(r + ": " + c + "\n")
 	}
 	return sb.String()
 }
