@@ -132,7 +132,7 @@ public class JarvisBot extends TelegramLongPollingBot {
         getFile.setFileId(fileId);
         org.telegram.telegrambots.meta.api.objects.File file = execute(getFile);
 
-        String localPath = System.getProperty("user.home") + "/jarvis_files/" + fileName;
+        String localPath = "/shared_files/" + fileName;
         downloadFile(file, new File(localPath));
         log.info("DEBUG: Файл скачан локально: {}", localPath);
 

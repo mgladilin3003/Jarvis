@@ -5,6 +5,8 @@ services:
     environment:
       - GO_AGENT_URL=http://go-agent:8081/api/v1/chat
     restart: always
+    volumes: 
+    - jarvis_data:/shared_files
 
   db:
     image: postgres:16-alpine
@@ -28,3 +30,8 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     depends_on:
       - db
+    volumes:
+      - jarvis_data:/shared_files
+      
+volumes:
+  jarvis_data:
