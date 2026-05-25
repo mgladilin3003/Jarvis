@@ -3,7 +3,7 @@ bot:
   token: "8629077876:AAFgX9tz2YHQy1VSrJZ7fi6C8EhX2Ae4ktM" # Токен, который дал @BotFather
 go:
   agent:
-    url: http://localhost:8081
+    url: http://go-agent:8081/api/v1/chat
 spring:
   datasource:
     url: jdbc:postgresql://postgres-db:5432/jarvis_db

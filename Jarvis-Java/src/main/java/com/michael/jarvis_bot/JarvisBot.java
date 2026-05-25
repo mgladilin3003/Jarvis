@@ -95,7 +95,7 @@ public class JarvisBot extends TelegramLongPollingBot {
                 body.add("user_id", String.valueOf(internalId));
                 body.add("session_id", String.valueOf(sessionId));
 
-                String safeUrl = (goAgentUrl != null) ? goAgentUrl + "/api/v1/chat" : "http://localhost:8081/api/v1/chat";
+                String safeUrl = (goAgentUrl != null) ? goAgentUrl: "http://localhost:8081/api/v1/chat";
 
                 try {
                     AgentResponse response = restTemplate.postForObject(safeUrl, body, AgentResponse.class);
