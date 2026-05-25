@@ -17,10 +17,10 @@ import (
 )
 
 var regQuestions = []string{
-	"Йо! Я Джарвис, твой новый цифровой бро. Рад, что ты меня подрубил. Чтобы я не был просто железкой, давай познакомимся по-человечески. Как тебя величать и сколько тебе лет?",
-	"Живем в мире, где всё перемешано. На каких языках тебе комфортнее штурмовать этот мир? Русский, английский, иврит — пиши, на чем удобно, я пойму всё.",
-	"Чем дышишь? Расскажи в паре слов, чем занимаешься по жизни. Ты программист, который сутками фиксит баги, или человек, который предпочитает движ и реальный мир?",
-	"Есть ли что-то, о чем я обязан знать, чтобы не накосячить? Ну, там, аллергия на плохие новости по утрам или особая любовь к мемам?",
+	"Йо! Я Джарвис. Чтобы я стал твоим напарником, давай познакомимся. Как тебя зовут и сколько тебе лет?",
+	"На каких языках тебе комфортнее общаться (русский, английский, иврит)?",
+	"Чем ты занимаешься по жизни? (Работа, хобби, движ или кодинг?)",
+	"Есть ли что-то важное, что мне стоит знать (аллергии, любовь к мемам, особые предпочтения)?",
 }
 
 type AgentResponse struct {
@@ -37,21 +37,15 @@ type Agent struct {
 
 func main() {
 	_ = godotenv.Load()
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	dbUrl := os.Getenv("DB_URL")
-
+	apiKey, dbUrl := os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("DB_URL")
 	db, err := sql.Open("postgres", dbUrl)
 	if err != nil {
-		log.Fatal("Ошибка БД:", err)
+		log.Fatal(err)
 	}
 
-	agent := &Agent{
-		claudeClient: anthropic.NewClient(apiKey),
-		db:           db,
-	}
-
+	agent := &Agent{claudeClient: anthropic.NewClient(apiKey), db: db}
 	http.HandleFunc("/api/v1/chat", agent.handleChat)
-	log.Println("🤖 Джарвис на связи. Порт :8081")
+	fmt.Println("🤖 Джарвис готов. Порт :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
 }
 
@@ -61,57 +55,44 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	sessionID, _ := strconv.Atoi(r.FormValue("session_id"))
 	uidStr := strconv.Itoa(uid)
 
-	// 1. Сохраняем сообщение с использованием sessionID
 	a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3)", uid, sessionID, msg)
 
-	// 2. Управление логикой
 	memCount := a.getMemCount(uidStr)
 	var systemPrompt string
 
-	// Правило бюджета токенов вшито прямо в строку
-	tokenBudget := "\nПРАВИЛО БЮДЖЕТА: Если запрос простой (факты, справки) — отвечай кратко (1-2 строки). Если вопрос сложный (бизнес-стратегия, архитектура) — отвечай подробно."
-
 	if memCount < len(regQuestions) {
-		// FLOW: Регистрация
-		systemPrompt = fmt.Sprintf("Ты Джарвис. Идет регистрация (%d/%d). Вопрос: %s. Если пользователь ответил, извлеки факт и сохрани в JSON: {\"key\": \"...\", \"value\": \"...\", \"cat\": \"profile\"}.", memCount+1, len(regQuestions), regQuestions[memCount])
+		systemPrompt = fmt.Sprintf("Ты Джарвис. Идет регистрация. Твой текущий вопрос: '%s'. Если пользователь ответил на него, извлеки факт и сохрани в JSON (в конце ответа): {\"key\": \"...\", \"value\": \"...\", \"cat\": \"profile\"}. Будь дружелюбным, не показывай пользователю JSON-код.", regQuestions[memCount])
 	} else if msg == "/new chat" {
-		// FLOW: Новый чат
-		systemPrompt = "Ты Джарвис. Новый чат. Задай настройки стиля, цели. Извлеки JSON: {\"key\": \"style/goal/features\", \"value\": \"...\", \"cat\": \"session\"}."
+		systemPrompt = "Ты Джарвис. Пользователь начал новый чат. Спроси про стиль и цель. Извлеки JSON в конце: {\"key\": \"style/goal\", \"value\": \"...\", \"cat\": \"session\"}."
 	} else {
-		// FLOW: Нормальное общение
 		profile := a.getMemories(uidStr)
-		systemPrompt = fmt.Sprintf("Ты Джарвис. Профиль: %s. Твоя задача: отвечать в стиле, заданном пользователем, используя IT-сленг если нужно. СТРОГИЙ HTML. %s", profile, tokenBudget)
+		systemPrompt = fmt.Sprintf("Ты Джарвис. Профиль: %s. Твоя задача: отвечать в стиле пользователя, используй IT-сленг. НИКАКОГО MARKDOWN (жирного, курсива, заголовков). Пиши чистый текст.", profile)
 	}
 
-	// 3. Отправка в Claude
 	model := "claude-haiku-4-5"
-	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
+	resp, _ := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
 		Model:     anthropic.Model(model),
 		MaxTokens: 2048,
 		System:    systemPrompt,
 		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(msg)}}},
 	})
 
-	if err != nil {
-		log.Println("Claude Error:", err)
-		http.Error(w, "Claude error", 500)
-		return
-	}
+	fullText := resp.Content[0].GetText()
 
-	responseText := resp.Content[0].GetText()
-
-	// 4. Парсинг и сохранение
-	if jsonStr := a.extractJSON(responseText); jsonStr != "" {
+	// 1. Извлекаем и сохраняем JSON (если есть)
+	if jsonStr := a.extractJSON(fullText); jsonStr != "" {
 		var m map[string]string
 		if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
 			a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uidStr, m["key"], m["value"], m["cat"])
 		}
 	}
 
-	// 5. Ответ
-	a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'assistant', $3)", uid, sessionID, responseText)
+	// 2. Чистим ответ от мусора (JSON и Markdown)
+	cleanText := a.cleanResponse(fullText)
+
+	a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'assistant', $3)", uid, sessionID, cleanText)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(AgentResponse{Text: responseText, Model: model})
+	json.NewEncoder(w).Encode(AgentResponse{Text: cleanText, Model: model})
 }
 
 // ХЕЛПЕРЫ
@@ -138,4 +119,15 @@ func (a *Agent) extractJSON(text string) string {
 		return text[s : e+1]
 	}
 	return ""
+}
+
+func (a *Agent) cleanResponse(text string) string {
+	// Убираем JSON блок
+	jsonPart := a.extractJSON(text)
+	text = strings.Replace(text, jsonPart, "", 1)
+	// Убираем Markdown
+	text = strings.ReplaceAll(text, "**", "")
+	text = strings.ReplaceAll(text, "#", "")
+	text = strings.ReplaceAll(text, "*", "")
+	return strings.TrimSpace(text)
 }
