@@ -65,27 +65,32 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	var systemPrompt string
 	if memCount < len(regQuestions) {
-		systemPrompt = fmt.Sprintf(`Ты Джарвис. Регистрация. 
+		// РЕЖИМ 1: РЕГИСТРАЦИЯ
+		systemPrompt = fmt.Sprintf(`Ты Джарвис. Идет регистрация. 
 		Вопросы: %s
 		Известно: [%s]
 		ПРАВИЛА:
-		1. ИСПОЛЬЗУЙ HTML: <b>жирный</b>, <u>подчеркнутый</u>. НИКАКИХ ЗВЕЗДОЧЕК (**).
-		2. НЕ ЗДОРОВАЙСЯ постоянно.
-		3. Отреагируй и задай СЛЕДУЮЩИЙ ВОПРОС из списка слово в слово.
+		1. ИСПОЛЬЗУЙ HTML: <b>жирный</b>, <u>подчеркнутый</u>. НИКАКИХ ЗВЕЗДОЧЕК И РЕШЕТОК.
+		2. Если пользователь ответил на ПОСЛЕДНИЙ вопрос регистрации (%d-й), то:
+		   - Подтверди, что данные сохранены.
+		   - СРАЗУ (в этом же сообщении) спроси: "Как сегодня будем общаться: по-дружески или серьезно?" и "Какая цель нашего первого чата?".
+		3. Иначе — просто задай СЛЕДУЮЩИЙ ВОПРОС из списка слово в слово.
 		4. В конце: ---JSON--- {"key":"...","value":"...","cat":"profile","title":"Знакомство"}`,
-			strings.Join(regQuestions, "\n"), memories)
+			strings.Join(regQuestions, "\n"), memories, len(regQuestions))
 	} else if sessionMsgCount <= 1 {
+		// РЕЖИМ 2: СТАРТ НОВОЙ СЕССИИ (после регистрации или /newchat)
 		systemPrompt = fmt.Sprintf(`Ты Джарвис. Пользователь: [%s]. Начало нового чата.
 		ПРАВИЛА:
 		1. Поприветствуй по имени (используй <b></b>). 
 		2. Спроси про тон (дружеский/серьезный) и цель чата.
-		3. Используй ЭМОДЗИ и HTML (<b>, <u>). НИКАКИХ ЗВЕЗДОЧЕК.
+		3. Используй ЭМОДЗИ и HTML (<b>, <u>). БЕЗ ЗВЕЗДОЧЕК.
 		4. В конце: ---JSON--- {"title": "Тема чата"}`, memories)
 	} else {
+		// РЕЖИМ 3: РАБОТА
 		systemPrompt = fmt.Sprintf(`Ты Джарвис. Память: [%s]. Контекст: %s.
 		ПРАВИЛА:
-		1. Общайся по делу, используй HTML. БЕЗ ЗВЕЗДОЧЕК.
-		2. Если сменили тему, обнови title: ---JSON--- {"title": "Новая тема"}`, memories, chatHistory)
+		1. Общайся по делу, используй HTML. БЕЗ ЗВЕЗДОЧЕК И РЕШЕТОК.
+		2. Если сменили тему, обнови title: ---JSON--- {"title": "Новое название чата"}`, memories, chatHistory)
 	}
 
 	resp, _ := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
@@ -112,8 +117,8 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 				a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, key, m["value"], m["cat"])
 			}
 			if title, ok := m["title"]; ok && title != "" {
-				// Исправлено под твою таблицу (sessions -> title)
 				a.db.Exec("UPDATE sessions SET title = $1 WHERE id = $2", title, sid)
+				log.Printf("📝 Title updated to: %s", title)
 			}
 		}
 	}
@@ -129,6 +134,7 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) cleanTrash(text string) string {
 	text = strings.ReplaceAll(text, "---JSON---", "")
 	text = strings.ReplaceAll(text, "**", "")
+	text = strings.ReplaceAll(text, "#", "")
 	return strings.TrimSpace(text)
 }
 
