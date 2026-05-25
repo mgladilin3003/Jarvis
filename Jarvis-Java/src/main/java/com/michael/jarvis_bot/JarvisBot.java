@@ -68,9 +68,6 @@ public class JarvisBot extends TelegramLongPollingBot {
                              (firstName != null) ? firstName : "User_" + telegramId;
 
             ensureUserExists(telegramId, username);
-            
-            // Сохраняем сразу в примитив int. Проверка на null больше не нужна,
-            // так как Spring выбросит исключение, если записи не окажется.
             int internalId = jdbcTemplate.queryForObject(
                     "SELECT id FROM users WHERE telegram_id = ?", Integer.class, telegramId);
 
