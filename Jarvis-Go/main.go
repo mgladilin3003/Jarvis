@@ -114,8 +114,16 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 		responseText := resp.Content[0].GetText()
 
 		// 3. Сохраняем ответ с привязкой к сессии
-		_, _ = a.db.Exec("INSERT INTO messages (user_id, session_id, role, content, tokens_used) VALUES ($1, $2, 'assistant', $3, $4)",
+		_, err = a.db.Exec("INSERT INTO messages (user_id, session_id, role, content, tokens_used) VALUES ($1, $2, 'assistant', $3, $4)",
 			userID, sessionID, responseText, resp.Usage.InputTokens+resp.Usage.OutputTokens)
+		if err != nil {
+			log.Printf("DB Error (Assistant message): %v", err)
+		}
+
+		// --- ВОТ ТУТ ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
+		// Устанавливаем заголовок, что мы отправляем JSON, ПЕРЕД отправкой данных
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
 
 		json.NewEncoder(w).Encode(AgentResponse{
 			Text:      responseText,
