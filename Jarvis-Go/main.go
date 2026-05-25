@@ -17,10 +17,10 @@ import (
 )
 
 var regQuestions = []string{
-	"Йо! Я Джарвис, твой новый цифровой бро. Рад, что ты меня подрубил. Чтобы я не был просто железкой, давай познакомимся по-человечески. Как тебя величать и сколько тебе лет (хотя в душе мы все дети, но мне для понимания)?",
-	"Живем в мире, где всё перемешано. На каких языках тебе комфортнее штурмовать этот мир? Русский, английский, иврит — пиши, на чем удобно, я пойму всё.",
-	"Чем дышишь? Расскажи в паре слов, чем занимаешься по жизни. Ты программист, который сутками фиксит баги, или человек, который предпочитает движ и реальный мир? Это поможет мне понимать, в каком ключе лучше «раскидывать» информацию.",
-	"Есть ли что-то, о чем я обязан знать, чтобы не накосячить? Ну, там, аллергия на плохие новости по утрам или особая любовь к мемам?",
+	"Йо! Я Джарвис, твой цифровой бро. Давай познакомимся. Как тебя величать и сколько тебе лет?",
+	"На каких языках тебе комфортнее штурмовать этот мир? Русский, английский, иврит?",
+	"Чем занимаешься по жизни? Программист, сутками фиксящий баги, или предпочитаешь реальный мир?",
+	"Есть ли что-то, о чем я обязан знать, чтобы не накосячить? (аллергии, предпочтения, ненавидишь утро?)",
 }
 
 type AgentResponse struct {
@@ -56,6 +56,7 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	memories := a.getMemories(uid)
 	memCount := a.getMemCount(uid)
 
+	// Считаем кол-во сообщений ДО вставки текущего (чтобы поймать старт сессии)
 	var sessionMsgCount int
 	a.db.QueryRow("SELECT COUNT(*) FROM messages WHERE session_id = $1 AND role = 'user'", sid).Scan(&sessionMsgCount)
 
@@ -64,33 +65,50 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 		uid, sid, msg).Scan(&userMessageID)
 
 	var systemPrompt string
+
 	if memCount < len(regQuestions) {
 		// РЕЖИМ 1: РЕГИСТРАЦИЯ
+		isLastQuestion := (memCount == len(regQuestions)-1)
+
+		var instruction string
+		if isLastQuestion {
+			instruction = `ПРАВИЛО ДЛЯ ЭТОГО ОТВЕТА: Это ПОСЛЕДНИЙ вопрос. 
+			1. Порадуйся и скажи: "Регистрация успешно завершена! 🎉". 
+			2. СРАЗУ ЖЕ (в этом же сообщении) спроси: "В каком тоне будем общаться дальше?" и "Какая цель нашего текущего диалога?".
+			3. В конце добавь: ---JSON--- {"key":"...","value":"...","cat":"profile","title":"Знакомство и настройка"}`
+		} else {
+			instruction = `Отреагируй на ответ и задай СЛЕДУЮЩИЙ ВОПРОС из списка слово в слово. 
+			В конце добавь: ---JSON--- {"key":"...","value":"...","cat":"profile"}`
+		}
+
 		systemPrompt = fmt.Sprintf(`Ты Джарвис. Идет регистрация. 
 		Вопросы: %s
 		Известно: [%s]
-		ПРАВИЛА:
-		1. ИСПОЛЬЗУЙ HTML: <b>жирный</b>, <u>подчеркнутый</u>. НИКАКИХ ЗВЕЗДОЧЕК И РЕШЕТОК.
-		2. Если пользователь ответил на ПОСЛЕДНИЙ вопрос регистрации (%d-й), то:
-		   - Подтверди, что данные сохранены.
-		   - СРАЗУ (в этом же сообщении) спроси: "Как сегодня будем общаться: по-дружески или серьезно?" и "Какая цель нашего первого чата?".
-		3. Иначе — просто задай СЛЕДУЮЩИЙ ВОПРОС из списка слово в слово.
-		4. В конце: ---JSON--- {"key":"...","value":"...","cat":"profile","title":"Знакомство"}`,
-			strings.Join(regQuestions, "\n"), memories, len(regQuestions))
-	} else if sessionMsgCount <= 1 {
-		// РЕЖИМ 2: СТАРТ НОВОЙ СЕССИИ (после регистрации или /newchat)
+		
+		ГЛАВНЫЕ ПРАВИЛА HTML:
+		ИСПОЛЬЗУЙ ТОЛЬКО <b>жирный</b>, <i>курсив</i>, <u>подчеркнутый</u>.
+		КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать <div>, <span>, <br>, style и любые другие теги. НИКАКИХ ЗВЕЗДОЧЕК (**).
+		
+		%s`, strings.Join(regQuestions, "\n"), memories, instruction)
+
+	} else if sessionMsgCount == 0 {
+		// РЕЖИМ 2: СТАРТ НОВОЙ СЕССИИ (/newchat)
 		systemPrompt = fmt.Sprintf(`Ты Джарвис. Пользователь: [%s]. Начало нового чата.
+		
 		ПРАВИЛА:
-		1. Поприветствуй по имени (используй <b></b>). 
-		2. Спроси про тон (дружеский/серьезный) и цель чата.
-		3. Используй ЭМОДЗИ и HTML (<b>, <u>). БЕЗ ЗВЕЗДОЧЕК.
-		4. В конце: ---JSON--- {"title": "Тема чата"}`, memories)
+		1. Поприветствуй пользователя (используй <b>имя</b>). 
+		2. Спроси про тон общения и цель этой конкретной сессии.
+		3. ИСПОЛЬЗУЙ ТОЛЬКО БАЗОВЫЙ HTML (<b>, <u>). ЗАПРЕЩЕНО использовать <div>, <br>, звездочки (**).
+		4. В самом конце добавь: ---JSON--- {"title": "Название темы в 2-3 слова"}`, memories)
+
 	} else {
 		// РЕЖИМ 3: РАБОТА
 		systemPrompt = fmt.Sprintf(`Ты Джарвис. Память: [%s]. Контекст: %s.
+		
 		ПРАВИЛА:
-		1. Общайся по делу, используй HTML. БЕЗ ЗВЕЗДОЧЕК И РЕШЕТОК.
-		2. Если сменили тему, обнови title: ---JSON--- {"title": "Новое название чата"}`, memories, chatHistory)
+		1. Общайся по делу, отвечай на вопросы.
+		2. ИСПОЛЬЗУЙ ТОЛЬКО БАЗОВЫЙ HTML (<b>, <u>). ЗАПРЕЩЕНО использовать <div>, <br>, звездочки (**).
+		3. Обязательно в конце выведи текущую тему диалога: ---JSON--- {"title": "Суть разговора в 2-3 слова"}`, memories, chatHistory)
 	}
 
 	resp, _ := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
@@ -112,14 +130,30 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 		cleanText = parts[0]
 		var m map[string]string
 		re := regexp.MustCompile(`\{.*\}`)
+
 		if err := json.Unmarshal([]byte(re.FindString(parts[1])), &m); err == nil {
+			// Сохраняем факты (если есть)
 			if key, ok := m["key"]; ok && key != "" {
 				a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, key, m["value"], m["cat"])
 			}
+
+			// ОБНОВЛЯЕМ НАЗВАНИЕ СЕССИИ (Title)
 			if title, ok := m["title"]; ok && title != "" {
-				a.db.Exec("UPDATE sessions SET title = $1 WHERE id = $2", title, sid)
-				log.Printf("📝 Title updated to: %s", title)
+				// Запрос к таблице chat_sessions. Если у тебя таблица называется иначе - поменяй тут.
+				res, err := a.db.Exec("UPDATE chat_sessions SET title = $1 WHERE id = $2", title, sid)
+				if err != nil {
+					log.Printf("❌ Ошибка обновления названия сессии: %v", err)
+				} else {
+					affected, _ := res.RowsAffected()
+					if affected == 0 {
+						log.Printf("⚠️ Сессия %s не найдена в БД для обновления title!", sid)
+					} else {
+						log.Printf("📝 Название сессии обновлено на: %s", title)
+					}
+				}
 			}
+		} else {
+			log.Printf("❌ Ошибка парсинга JSON: %v", err)
 		}
 	}
 
@@ -131,10 +165,16 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(AgentResponse{Text: finalText, Model: "claude-haiku-4-5"})
 }
 
+// Усиленная функция очистки мусора
 func (a *Agent) cleanTrash(text string) string {
 	text = strings.ReplaceAll(text, "---JSON---", "")
 	text = strings.ReplaceAll(text, "**", "")
 	text = strings.ReplaceAll(text, "#", "")
+
+	// Жестко вырезаем <div>, <br> и <span>, если Клод попытается их использовать
+	reDivs := regexp.MustCompile(`(?i)<div[^>]*>|</div>|<br\s*/?>|<span[^>]*>|</span>`)
+	text = reDivs.ReplaceAllString(text, "")
+
 	return strings.TrimSpace(text)
 }
 
