@@ -71,9 +71,13 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	userID, _ := strconv.Atoi(r.FormValue("user_id"))
 	sessionID, _ := strconv.Atoi(r.FormValue("session_id"))
 
-	// 1. Сохраняем сообщение пользователя с привязкой к сессии
-	_, err := a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3)",
-		userID, sessionID, userMessage)
+	// 1. Сохраняем сообщение пользователя и СРАЗУ ПОЛУЧАЕМ ЕГО ID
+	var userMessageID int
+	err := a.db.QueryRow(`
+		INSERT INTO messages (user_id, session_id, role, content) 
+		VALUES ($1, $2, 'user', $3) RETURNING id`,
+		userID, sessionID, userMessage).Scan(&userMessageID)
+
 	if err != nil {
 		log.Printf("DB Error (User message): %v", err)
 	}
@@ -113,15 +117,23 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	if len(resp.Content) > 0 {
 		responseText := resp.Content[0].GetText()
 
-		// 3. Сохраняем ответ с привязкой к сессии
-		_, err = a.db.Exec("INSERT INTO messages (user_id, session_id, role, content, tokens_used) VALUES ($1, $2, 'assistant', $3, $4)",
-			userID, sessionID, responseText, resp.Usage.InputTokens+resp.Usage.OutputTokens)
+		// 3. ОБНОВЛЯЕМ строку пользователя (записываем потраченные токены на запрос)
+		_, err = a.db.Exec("UPDATE messages SET tokens_used = $1 WHERE id = $2",
+			resp.Usage.InputTokens, userMessageID)
+		if err != nil {
+			log.Printf("DB Error (Update user tokens): %v", err)
+		}
+
+		// 4. СОХРАНЯЕМ ответ ассистента (пишем токены, потраченные только на генерацию ответа)
+		_, err = a.db.Exec(`
+			INSERT INTO messages (user_id, session_id, role, content, tokens_used) 
+			VALUES ($1, $2, 'assistant', $3, $4)`,
+			userID, sessionID, responseText, resp.Usage.OutputTokens)
 		if err != nil {
 			log.Printf("DB Error (Assistant message): %v", err)
 		}
 
-		// --- ВОТ ТУТ ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
-		// Устанавливаем заголовок, что мы отправляем JSON, ПЕРЕД отправкой данных
+		// Устанавливаем заголовок JSON и отправляем ответ в Java-бот
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
