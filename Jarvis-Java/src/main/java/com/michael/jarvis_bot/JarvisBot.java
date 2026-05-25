@@ -11,10 +11,14 @@ import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestTemplate;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.ActionType;
+import org.telegram.telegrambots.meta.api.methods.GetFile;
 import org.telegram.telegrambots.meta.api.methods.send.SendChatAction;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.Message;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import java.io.File;
 
 @Component
 public class JarvisBot extends TelegramLongPollingBot {
@@ -57,54 +61,98 @@ public class JarvisBot extends TelegramLongPollingBot {
 
     @Override
     public void onUpdateReceived(Update update) {
-        if (update != null && update.hasMessage() && update.getMessage().hasText()) {
-            String messageFromUser = update.getMessage().getText();
-            long chatId = update.getMessage().getChatId();
-            long telegramId = update.getMessage().getFrom().getId();
-            
-            String rawUsername = update.getMessage().getFrom().getUserName();
-            String firstName = update.getMessage().getFrom().getFirstName();
-            String username = (rawUsername != null) ? rawUsername : 
-                             (firstName != null) ? firstName : "User_" + telegramId;
+        if (update != null && update.hasMessage()) {
+            Message message = update.getMessage();
+            long chatId = message.getChatId();
 
-            ensureUserExists(telegramId, username);
-            int internalId = jdbcTemplate.queryForObject(
-                    "SELECT id FROM users WHERE telegram_id = ?", Integer.class, telegramId);
+            // 1. ОБРАБОТКА ТЕКСТА
+            if (message.hasText()) {
+                String messageFromUser = message.getText();
+                long telegramId = message.getFrom().getId();
+                
+                String rawUsername = message.getFrom().getUserName();
+                String firstName = message.getFrom().getFirstName();
+                String username = (rawUsername != null) ? rawUsername : 
+                                 (firstName != null) ? firstName : "User_" + telegramId;
 
-            // Обработка команд
-            if ("/newchat".equals(messageFromUser)) {
-                jdbcTemplate.update("UPDATE chat_sessions SET is_active = FALSE WHERE user_id = ?", internalId);
-                sendText(chatId, "✅ <b>Контекст сброшен.</b>");
-                return;
-            }
+                ensureUserExists(telegramId, username);
+                int internalId = jdbcTemplate.queryForObject(
+                        "SELECT id FROM users WHERE telegram_id = ?", Integer.class, telegramId);
 
-            log.info("Запрос от {}: {}", username, messageFromUser);
-            sendTypingAction(chatId);
-
-            Integer sessionId = getOrCreateActiveSession(internalId);
-            
-            MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
-            body.add("message", messageFromUser);
-            body.add("user_id", String.valueOf(internalId));
-            body.add("session_id", String.valueOf(sessionId));
-
-            String safeUrl = (goAgentUrl != null) ? goAgentUrl : "http://localhost:8081/api/v1/chat";
-
-            try {
-                AgentResponse response = restTemplate.postForObject(safeUrl, body, AgentResponse.class);
-
-                if (response != null && response.text() != null) {
-                    sendText(chatId, response.text());
-                    int totalTokens = response.tokens_in() + response.tokens_out();
-                    jdbcTemplate.update(
-                            "UPDATE users SET tokens_used_today = tokens_used_today + ? WHERE id = ?",
-                            totalTokens, internalId
-                    );
+                if ("/newchat".equals(messageFromUser)) {
+                    jdbcTemplate.update("UPDATE chat_sessions SET is_active = FALSE WHERE user_id = ?", internalId);
+                    sendText(chatId, "✅ <b>Контекст сброшен.</b>");
+                    return;
                 }
-            } catch (Exception e) {
-                log.error("Ошибка связи: {}", e.getMessage());
-                sendText(chatId, "Ошибка: Мозг системы недоступен.");
+
+                log.info("Запрос от {}: {}", username, messageFromUser);
+                sendTypingAction(chatId);
+
+                Integer sessionId = getOrCreateActiveSession(internalId);
+                
+                MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+                body.add("message", messageFromUser);
+                body.add("user_id", String.valueOf(internalId));
+                body.add("session_id", String.valueOf(sessionId));
+
+                String safeUrl = (goAgentUrl != null) ? goAgentUrl + "/api/v1/chat" : "http://localhost:8081/api/v1/chat";
+
+                try {
+                    AgentResponse response = restTemplate.postForObject(safeUrl, body, AgentResponse.class);
+                    if (response != null && response.text() != null) {
+                        sendText(chatId, response.text());
+                        int totalTokens = response.tokens_in() + response.tokens_out();
+                        jdbcTemplate.update(
+                                "UPDATE users SET tokens_used_today = tokens_used_today + ? WHERE id = ?",
+                                totalTokens, internalId
+                        );
+                    }
+                } catch (Exception e) {
+                    log.error("Ошибка связи: {}", e.getMessage());
+                    sendText(chatId, "Ошибка: Мозг системы недоступен.");
+                }
+            } 
+            // 2. ОБРАБОТКА ФАЙЛОВ
+            else if (message.hasDocument()) {
+                handleDocument(message);
             }
+        }
+    }
+
+    private void handleDocument(Message message) {
+        long chatId = message.getChatId();
+        String fileId = message.getDocument().getFileId();
+        String fileName = message.getDocument().getFileName();
+        
+        log.info("DEBUG: Получен файл: {} (ID: {})", fileName, fileId);
+        sendText(chatId, "📄 Файл принят, анализирую...");
+
+        try {
+            GetFile getFile = new GetFile();
+            getFile.setFileId(fileId);
+            org.telegram.telegrambots.meta.api.objects.File file = execute(getFile);
+
+            // Путь для сохранения на Малинке
+          String localPath = System.getProperty("user.home") + "/jarvis_files/" + fileName;
+            downloadFile(file, new File(localPath));
+            log.info("DEBUG: Файл скачан локально: {}", localPath);
+
+            MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+            body.add("file_path", localPath);
+            
+            String safeUrl = (goAgentUrl != null) ? goAgentUrl + "/api/v1/analyze_file" : "http://localhost:8081/api/v1/analyze_file";
+            
+            AgentResponse response = restTemplate.postForObject(safeUrl, body, AgentResponse.class);
+            
+            if (response != null && response.text() != null) {
+                sendText(chatId, "✅ <b>Результат анализа:</b>\n" + response.text());
+            } else {
+                sendText(chatId, "⚠️ Файл обработан, но ответ пуст.");
+            }
+
+        } catch (Exception e) {
+            log.error("ERROR: Ошибка при обработке файла: ", e);
+            sendText(chatId, "❌ Ошибка при обработке файла: " + e.getMessage());
         }
     }
 
@@ -145,11 +193,7 @@ public class JarvisBot extends TelegramLongPollingBot {
         try {
             execute(sm);
         } catch (TelegramApiException e) {
-            try {
-                execute(SendMessage.builder().chatId(String.valueOf(chatId)).text(safeText).build());
-            } catch (TelegramApiException ex) {
-                log.error("Send error: {}", ex.getMessage());
-            }
+            log.error("Send error: {}", e.getMessage());
         }
     }
 }
