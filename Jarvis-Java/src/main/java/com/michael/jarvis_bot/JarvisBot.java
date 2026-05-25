@@ -4,7 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
-import org.springframework.jdbc.core.JdbcTemplate; // Добавлено для работы с БД
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
@@ -22,17 +22,21 @@ public class JarvisBot extends TelegramLongPollingBot {
     private static final Logger log = LoggerFactory.getLogger(JarvisBot.class);
 
     private final String botUsername;
+    private final String botToken;
     private final RestTemplate restTemplate;
-    private final JdbcTemplate jdbcTemplate; // Поле для работы с базой
+    private final JdbcTemplate jdbcTemplate;
 
     @Value("${go.agent.url}")
     private String goAgentUrl;
 
+    public record AgentResponse(String text, int tokens_in, int tokens_out, String model) {}
+
     public JarvisBot(@Value("${bot.name}") String botUsername, 
                      @Value("${bot.token}") String botToken,
-                     JdbcTemplate jdbcTemplate) { // Spring сам внедрит JdbcTemplate
+                     JdbcTemplate jdbcTemplate) {
         super(botToken);
         this.botUsername = botUsername;
+        this.botToken = botToken;
         this.jdbcTemplate = jdbcTemplate;
         
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
@@ -46,84 +50,108 @@ public class JarvisBot extends TelegramLongPollingBot {
         return this.botUsername;
     }
 
-    @SuppressWarnings("null")
+    @Override
+    public String getBotToken() {
+        return this.botToken;
+    }
+
     @Override
     public void onUpdateReceived(Update update) {
-        if (update.hasMessage() && update.getMessage().hasText()) {
+        if (update != null && update.hasMessage() && update.getMessage().hasText()) {
             String messageFromUser = update.getMessage().getText();
             long chatId = update.getMessage().getChatId();
+            long telegramId = update.getMessage().getFrom().getId();
             
-            // Исправление Null type safety для username
-            String username = update.getMessage().getFrom().getUserName();
-            if (username == null) {
-                username = update.getMessage().getFrom().getFirstName();
-                if (username == null) username = "User_" + chatId;
+            String rawUsername = update.getMessage().getFrom().getUserName();
+            String firstName = update.getMessage().getFrom().getFirstName();
+            String username = (rawUsername != null) ? rawUsername : 
+                             (firstName != null) ? firstName : "User_" + telegramId;
+
+            ensureUserExists(telegramId, username);
+            
+            // Сохраняем сразу в примитив int. Проверка на null больше не нужна,
+            // так как Spring выбросит исключение, если записи не окажется.
+            int internalId = jdbcTemplate.queryForObject(
+                    "SELECT id FROM users WHERE telegram_id = ?", Integer.class, telegramId);
+
+            // Обработка команд
+            if ("/newchat".equals(messageFromUser)) {
+                jdbcTemplate.update("UPDATE chat_sessions SET is_active = FALSE WHERE user_id = ?", internalId);
+                sendText(chatId, "✅ <b>Контекст сброшен.</b>");
+                return;
             }
 
-            log.info("Получено сообщение от {}: {}", chatId, messageFromUser);
-            
-            // ШАГ 1: Регистрация пользователя в БД (чтобы Go-агент его нашел)
-            ensureUserExists(chatId, username);
-            
-            // ШАГ 2: Индикатор печати
+            log.info("Запрос от {}: {}", username, messageFromUser);
             sendTypingAction(chatId);
+
+            Integer sessionId = getOrCreateActiveSession(internalId);
             
-            // ШАГ 3: Запрос к Go-агенту
             MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
             body.add("message", messageFromUser);
-            body.add("user_id", String.valueOf(chatId));
+            body.add("user_id", String.valueOf(internalId));
+            body.add("session_id", String.valueOf(sessionId));
+
+            String safeUrl = (goAgentUrl != null) ? goAgentUrl : "http://localhost:8081/api/v1/chat";
 
             try {
-                     String responseFromClaude = restTemplate.postForObject(goAgentUrl, body, String.class);
+                AgentResponse response = restTemplate.postForObject(safeUrl, body, AgentResponse.class);
 
-                    if (responseFromClaude != null) {
-                        sendText(chatId, responseFromClaude);
-                    } else {
-                        log.warn("Go-агент вернул пустой ответ для пользователя {}", chatId);
-                        sendText(chatId, "<i>Джарвис задумался и не смог ответить. Попробуйте еще раз.</i>");
-}
+                if (response != null && response.text() != null) {
+                    sendText(chatId, response.text());
+                    int totalTokens = response.tokens_in() + response.tokens_out();
+                    jdbcTemplate.update(
+                            "UPDATE users SET tokens_used_today = tokens_used_today + ? WHERE id = ?",
+                            totalTokens, internalId
+                    );
+                }
             } catch (Exception e) {
-                log.error("Ошибка при запросе к Go-агенту ({}): {}", goAgentUrl, e.getMessage());
-                sendText(chatId, "<b>Ошибка:</b> Повар на кухне (Go) не отвечает!");
+                log.error("Ошибка связи: {}", e.getMessage());
+                sendText(chatId, "Ошибка: Мозг системы недоступен.");
             }
+        }
+    }
+
+    private Integer getOrCreateActiveSession(int internalId) {
+        String selectSql = "SELECT id FROM chat_sessions WHERE user_id = ? AND is_active = TRUE ORDER BY created_at DESC LIMIT 1";
+        try {
+            return jdbcTemplate.queryForObject(selectSql, Integer.class, internalId);
+        } catch (Exception e) {
+            jdbcTemplate.update("INSERT INTO chat_sessions (user_id, title) VALUES (?, ?)", 
+                               internalId, "Session " + System.currentTimeMillis());
+            return jdbcTemplate.queryForObject(selectSql, Integer.class, internalId);
         }
     }
 
     private void ensureUserExists(long telegramId, String username) {
-        String sql = "INSERT INTO users (telegram_id, username) VALUES (?, ?) ON CONFLICT (telegram_id) DO NOTHING";
-        try {
-            jdbcTemplate.update(sql, telegramId, username);
-        } catch (Exception e) {
-            log.error("Ошибка при проверке пользователя в БД: {}", e.getMessage());
-        }
+        jdbcTemplate.update("INSERT INTO users (telegram_id, username) VALUES (?, ?) ON CONFLICT (telegram_id) DO NOTHING", 
+                           telegramId, username);
     }
 
     private void sendTypingAction(long chatId) {
         try {
-            SendChatAction typingAction = SendChatAction.builder()
-                    .chatId(chatId)
+            execute(SendChatAction.builder()
+                    .chatId(String.valueOf(chatId))
                     .action(ActionType.TYPING.toString())
-                    .build();
-            execute(typingAction);
+                    .build());
         } catch (TelegramApiException e) {
-            log.error("Не удалось отправить статус TYPING: {}", e.getMessage());
+            log.error("Typing error: {}", e.getMessage());
         }
     }
 
     private void sendText(long chatId, String text) {
+        String safeText = (text != null) ? text : "Empty response";
         SendMessage sm = SendMessage.builder()
-                .chatId(chatId)
-                .text(text)
+                .chatId(String.valueOf(chatId))
+                .text(safeText)
                 .parseMode("HTML")
                 .build();
         try {
             execute(sm);
         } catch (TelegramApiException e) {
-            log.warn("Ошибка отправки HTML сообщения, пробуем обычный текст: {}", e.getMessage());
             try {
-                execute(SendMessage.builder().chatId(chatId).text(text).build());
+                execute(SendMessage.builder().chatId(String.valueOf(chatId)).text(safeText).build());
             } catch (TelegramApiException ex) {
-                log.error("Критическая ошибка отправки: {}", ex.getMessage());
+                log.error("Send error: {}", ex.getMessage());
             }
         }
     }

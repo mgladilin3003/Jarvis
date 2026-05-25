@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,6 +15,13 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/liushuangls/go-anthropic/v2"
 )
+
+type AgentResponse struct {
+	Text      string `json:"text"`
+	TokensIn  int    `json:"tokens_in"`
+	TokensOut int    `json:"tokens_out"`
+	Model     string `json:"model"`
+}
 
 type Agent struct {
 	claudeClient *anthropic.Client
@@ -27,26 +35,20 @@ type ChatMessage struct {
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("Файл .env не найден, используем системные переменные")
+		log.Println("Файл .env не найден")
 	}
 
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	dbUrl := os.Getenv("DB_URL")
 	if apiKey == "" || dbUrl == "" {
-		log.Fatal("Критическая ошибка! Проверь ANTHROPIC_API_KEY и DB_URL")
+		log.Fatal("Критическая ошибка переменных окружения")
 	}
 
-	// Инициализация стандартного драйвера sql
 	db, err := sql.Open("postgres", dbUrl)
 	if err != nil {
-		log.Fatal("Ошибка подключения к БД:", err)
+		log.Fatal("Ошибка БД:", err)
 	}
 	defer db.Close()
-
-	// Проверка соединения
-	if err := db.Ping(); err != nil {
-		log.Fatal("База данных недоступна:", err)
-	}
 
 	agent := &Agent{
 		claudeClient: anthropic.NewClient(apiKey),
@@ -54,7 +56,7 @@ func main() {
 	}
 
 	http.HandleFunc("/api/v1/chat", agent.handleChat)
-	fmt.Println("🤖 Джарвис (Stateless) готов. Сервер на :8081")
+	fmt.Println("🤖 Джарвис готов. Порт :8081")
 
 	server := &http.Server{
 		Addr:         ":8081",
@@ -66,32 +68,22 @@ func main() {
 
 func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	userMessage := r.FormValue("message")
-	telegramIDStr := r.FormValue("user_id")
-	telegramID, _ := strconv.ParseInt(telegramIDStr, 10, 64)
+	userID, _ := strconv.Atoi(r.FormValue("user_id"))
+	sessionID, _ := strconv.Atoi(r.FormValue("session_id"))
 
-	// 1. ПОЛУЧАЕМ ВНУТРЕННИЙ ID ПОЛЬЗОВАТЕЛЯ
-	var userID int
-	err := a.db.QueryRow("SELECT id FROM users WHERE telegram_id = $1", telegramID).Scan(&userID)
+	// 1. Сохраняем сообщение пользователя с привязкой к сессии
+	_, err := a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3)",
+		userID, sessionID, userMessage)
 	if err != nil {
-		// Если пользователя нет, Java-бот должен был его создать. Но на всякий случай:
-		log.Printf("Пользователь %d не найден в базе", telegramID)
-		http.Error(w, "User not found", http.StatusForbidden)
-		return
+		log.Printf("DB Error (User message): %v", err)
 	}
 
-	// 2. СОХРАНЯЕМ ВХОДЯЩЕЕ СООБЩЕНИЕ
-	_, err = a.db.Exec("INSERT INTO messages (user_id, role, content) VALUES ($1, 'user', $2)", userID, userMessage)
+	// 2. Получаем историю конкретно этой сессии
+	history, err := a.getHistory(userID, sessionID)
 	if err != nil {
-		log.Printf("Ошибка записи сообщения пользователя: %v", err)
+		log.Printf("History Error: %v", err)
 	}
 
-	// 3. ПОЛУЧАЕМ ИСТОРИЮ (последние 10 сообщений)
-	history, err := a.getHistory(userID)
-	if err != nil {
-		log.Printf("Ошибка получения истории: %v", err)
-	}
-
-	// 4. ФОРМИРУЕМ МАССИВ ДЛЯ CLAUDE
 	var messages []anthropic.Message
 	for _, msg := range history {
 		role := anthropic.RoleUser
@@ -104,47 +96,43 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// 5. ЗАПРОС К CLAUDE
+	modelName := "claude-haiku-4-5"
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
-		Model:     "claude-haiku-4-5", // Исправлено на актуальную модель
+		Model:     anthropic.Model(modelName),
 		MaxTokens: 2048,
-		System: `Твоя роль: AI-ассистент Jarvis. 
-Твой протокол вывода: СТРОГИЙ HTML.
-ЗАПРЕТЫ:
-1. ВСЕГДА УДАЛЯЙ СИМВОЛЫ # И * . КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать Markdown-разметку.
-2. Используй ТОЛЬКО HTML-теги: <b>, <i>, <u>, <code>.
-3. Списки оформляй через эмодзи (• или 🔹).`,
-		Messages: messages,
+		System:    "Твоя роль: AI-ассистент Jarvis. Вывод: СТРОГИЙ HTML. ЗАПРЕТ: Markdown (#, *). Теги: <b>, <i>, <u>, <code>.",
+		Messages:  messages,
 	})
 
 	if err != nil {
-		log.Printf("Ошибка Claude: %v", err)
-		http.Error(w, "Ошибка Claude: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("Claude Error: %v", err)
+		http.Error(w, err.Error(), 500)
 		return
 	}
 
-	// 6. ОБРАБОТКА ОТВЕТА И СОХРАНЕНИЕ
 	if len(resp.Content) > 0 {
 		responseText := resp.Content[0].GetText()
 
-		// Сохраняем ответ ассистента в базу
-		_, err = a.db.Exec("INSERT INTO messages (user_id, role, content, tokens_used) VALUES ($1, 'assistant', $2, $3)",
-			userID, responseText, resp.Usage.InputTokens+resp.Usage.OutputTokens)
-		if err != nil {
-			log.Printf("Ошибка записи ответа ассистента: %v", err)
-		}
+		// 3. Сохраняем ответ с привязкой к сессии
+		_, _ = a.db.Exec("INSERT INTO messages (user_id, session_id, role, content, tokens_used) VALUES ($1, $2, 'assistant', $3, $4)",
+			userID, sessionID, responseText, resp.Usage.InputTokens+resp.Usage.OutputTokens)
 
-		fmt.Fprint(w, responseText)
+		json.NewEncoder(w).Encode(AgentResponse{
+			Text:      responseText,
+			TokensIn:  resp.Usage.InputTokens,
+			TokensOut: resp.Usage.OutputTokens,
+			Model:     modelName,
+		})
 	}
 }
 
-func (a *Agent) getHistory(userID int) ([]ChatMessage, error) {
+func (a *Agent) getHistory(userID int, sessionID int) ([]ChatMessage, error) {
 	rows, err := a.db.Query(`
 		SELECT role, content 
 		FROM messages 
-		WHERE user_id = $1 
+		WHERE user_id = $1 AND session_id = $2
 		ORDER BY created_at DESC 
-		LIMIT 10`, userID)
+		LIMIT 10`, userID, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +144,6 @@ func (a *Agent) getHistory(userID int) ([]ChatMessage, error) {
 		if err := rows.Scan(&m.Role, &m.Content); err != nil {
 			return nil, err
 		}
-		// Разворачиваем историю в правильном порядке (от старых к новым)
 		history = append([]ChatMessage{m}, history...)
 	}
 	return history, nil
