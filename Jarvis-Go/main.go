@@ -50,6 +50,15 @@ func main() {
 }
 
 func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
+	// Включаем "щит" от краша
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("❌ CRITICAL: Go-agent PANIC caught: %v", r)
+		}
+	}()
+
+	log.Printf("📥 ЗАПРОС ПРИШЕЛ: %s", r.FormValue("message")) // ЛОГ - если он не появится, значит проблема в сети
+
 	msg := r.FormValue("message")
 	uid, _ := strconv.Atoi(r.FormValue("user_id"))
 	sessionID, _ := strconv.Atoi(r.FormValue("session_id"))
