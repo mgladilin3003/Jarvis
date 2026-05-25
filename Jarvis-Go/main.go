@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/joho/godotenv"
@@ -16,10 +17,10 @@ import (
 )
 
 var regQuestions = []string{
-	"Йо! Я Джарвис. Чтобы я стал твоим напарником, давай познакомимся. Как тебя зовут и сколько тебе лет?",
-	"На каких языках тебе комфортнее общаться (русский, английский, иврит)?",
-	"Чем ты занимаешься по жизни? (Работа, хобби, движ или кодинг?)",
-	"Есть ли что-то важное, что мне стоит знать (аллергии, любовь к мемам, особые предпочтения)?",
+	"Как тебя зовут и сколько тебе лет?",
+	"На каких языках тебе комфортнее общаться?",
+	"Чем ты занимаешься по жизни (работа/хобби)?",
+	"Есть ли что-то важное, что мне стоит знать (аллергии, предпочтения)?",
 }
 
 type AgentResponse struct {
@@ -49,52 +50,85 @@ func main() {
 func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	msg := r.FormValue("message")
 	uid := r.FormValue("user_id")
+	sid := r.FormValue("session_id")
 
-	// Получаем текущие данные из БД
-	memories := a.getMemories(uid)
+	// 1. Запись сообщения пользователя
+	var userMessageID int64
+	err := a.db.QueryRow("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3) RETURNING id",
+		uid, sid, msg).Scan(&userMessageID)
+	if err != nil {
+		log.Printf("❌ Ошибка записи сообщения: %v", err)
+	}
+
 	memCount := a.getMemCount(uid)
+	memories := a.getMemories(uid)
 
-	// СТРОГИЙ ПРОМПТ: Мы явно пишем, что он знает
-	systemPrompt := fmt.Sprintf(`Ты Джарвис. Регистрация (%d/%d). 
+	systemPrompt := fmt.Sprintf(`Ты Джарвис. Регистрация. 
+    Текущий этап: %d из %d. 
+    Вопрос пользователю: "%s".
     Уже известно о пользователе: %s.
-    Если пользователь ответил на текущий вопрос, сохрани ответ в JSON [JSON]{"key":"...","value":"...","cat":"profile"}[/JSON].
-    Если информации достаточно для перехода к следующему вопросу, не переспрашивай старое.
-    Текущий вопрос: %s`,
-		memCount, len(regQuestions), memories, regQuestions[memCount])
+    ИНСТРУКЦИЯ:
+    1. Ответь пользователю дружелюбно.
+    2. Если пользователь ответил на вопрос, СРАЗУ ПОСЛЕ ответа напиши разделитель ---JSON--- и после него JSON: {"key":"...","value":"...","cat":"profile"}.
+    3. НЕ ПОВТОРЯЙ вопросы, на которые уже есть ответы в базе.`,
+		memCount+1, len(regQuestions), regQuestions[memCount], memories)
 
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
 		Model:     anthropic.Model("claude-haiku-4-5"),
-		MaxTokens: 2048,
+		MaxTokens: 1024,
 		System:    systemPrompt,
 		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(msg)}}},
 	})
 
 	if err != nil {
 		log.Printf("❌ API Error: %v", err)
-		http.Error(w, "Claude API error", 500)
+		http.Error(w, "Claude error", 500)
 		return
+	}
+
+	// 2. Обновление токенов пользователя
+	if userMessageID != 0 {
+		a.db.Exec("UPDATE messages SET tokens_used = $1 WHERE id = $2", resp.Usage.InputTokens, userMessageID)
 	}
 
 	fullText := resp.Content[0].GetText()
 
-	// Парсинг JSON
-	jsonStr := a.extractTaggedJSON(fullText)
-	if jsonStr != "" {
-		var m map[string]string
-		if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
-			a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, m["key"], m["value"], m["cat"])
-			log.Printf("✅ Записано: %s", m["key"])
+	// 3. Парсинг данных
+	var cleanText string
+	if strings.Contains(fullText, "---JSON---") {
+		parts := strings.Split(fullText, "---JSON---")
+		cleanText = parts[0]
+
+		jsonPart := parts[1]
+		re := regexp.MustCompile(`\{.*\}`)
+		match := re.FindString(jsonPart)
+		if match != "" {
+			var m map[string]string
+			if err := json.Unmarshal([]byte(match), &m); err == nil {
+				a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, m["key"], m["value"], m["cat"])
+				log.Printf("✅ Записано: %s", m["key"])
+			}
 		}
+	} else {
+		cleanText = fullText
 	}
 
-	// Очистка от мусора
-	cleanText := a.cleanResponse(fullText)
+	// 4. Запись ответа бота с его токенами
+	finalText := a.cleanTrash(cleanText)
+	a.db.Exec(`INSERT INTO messages (user_id, session_id, role, content, tokens_used) VALUES ($1, $2, 'assistant', $3, $4)`,
+		uid, sid, finalText, resp.Usage.OutputTokens)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(AgentResponse{Text: cleanText, Model: "claude-haiku-4-5"})
+	json.NewEncoder(w).Encode(AgentResponse{Text: finalText, Model: "claude-haiku-4-5"})
 }
 
-// ХЕЛПЕРЫ
+func (a *Agent) cleanTrash(text string) string {
+	reTags := regexp.MustCompile(`(?i)\[JSON\].*?\[/JSON\]`)
+	text = reTags.ReplaceAllString(text, "")
+	text = strings.ReplaceAll(text, "---JSON---", "")
+	return strings.TrimSpace(text)
+}
+
 func (a *Agent) getMemCount(uid string) int {
 	var count int
 	a.db.QueryRow("SELECT COUNT(*) FROM memories WHERE user_id = $1", uid).Scan(&count)
@@ -110,25 +144,4 @@ func (a *Agent) getMemories(uid string) string {
 		sb.WriteString(k + ": " + v + "; ")
 	}
 	return sb.String()
-}
-
-func (a *Agent) extractTaggedJSON(text string) string {
-	s := strings.Index(text, "[JSON]")
-	e := strings.Index(text, "[/JSON]")
-	if s != -1 && e != -1 && e > s {
-		return text[s+6 : e]
-	}
-	return ""
-}
-
-func (a *Agent) cleanResponse(text string) string {
-	s := strings.Index(text, "[JSON]")
-	e := strings.Index(text, "[/JSON]")
-	if s != -1 && e != -1 {
-		text = text[:s] + text[e+7:]
-	}
-	text = strings.ReplaceAll(text, "**", "")
-	text = strings.ReplaceAll(text, "#", "")
-	text = strings.ReplaceAll(text, "*", "")
-	return strings.TrimSpace(text)
 }
