@@ -49,25 +49,18 @@ func main() {
 func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	msg := r.FormValue("message")
 	uid := r.FormValue("user_id")
-	sid := r.FormValue("session_id")
 
-	log.Printf("📥 [DEBUG] Запрос: %s (UID: %s, SID: %s)", msg, uid, sid)
-
-	// Сохраняем сообщение с учетом session_id
-	_, err := a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3)", uid, sid, msg)
-	if err != nil {
-		log.Printf("❌ [ERROR] Ошибка записи сообщения: %v", err)
-	}
-
+	// Получаем текущие данные из БД
+	memories := a.getMemories(uid)
 	memCount := a.getMemCount(uid)
-	log.Printf("📥 [DEBUG] Текущий memCount: %d", memCount)
 
-	var systemPrompt string
-	if memCount < len(regQuestions) {
-		systemPrompt = fmt.Sprintf("Ты Джарвис. Регистрация (%d/%d). Вопрос: '%s'. Если ответ получен, ОБЯЗАТЕЛЬНО ответь в формате [JSON]{\"key\":\"...\",\"value\":\"...\",\"cat\":\"profile\"}[/JSON] в конце. Не показывай JSON пользователю.", memCount+1, len(regQuestions), regQuestions[memCount])
-	} else {
-		systemPrompt = fmt.Sprintf("Ты Джарвис. Профиль: %s. Ответы без Markdown.", a.getMemories(uid))
-	}
+	// СТРОГИЙ ПРОМПТ: Мы явно пишем, что он знает
+	systemPrompt := fmt.Sprintf(`Ты Джарвис. Регистрация (%d/%d). 
+    Уже известно о пользователе: %s.
+    Если пользователь ответил на текущий вопрос, сохрани ответ в JSON [JSON]{"key":"...","value":"...","cat":"profile"}[/JSON].
+    Если информации достаточно для перехода к следующему вопросу, не переспрашивай старое.
+    Текущий вопрос: %s`,
+		memCount, len(regQuestions), memories, regQuestions[memCount])
 
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
 		Model:     anthropic.Model("claude-haiku-4-5"),
@@ -77,34 +70,26 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if err != nil {
-		log.Printf("❌ [ERROR] Claude API: %v", err)
-		http.Error(w, "Claude error", 500)
+		log.Printf("❌ API Error: %v", err)
+		http.Error(w, "Claude API error", 500)
 		return
 	}
 
 	fullText := resp.Content[0].GetText()
-	log.Printf("📥 [DEBUG] Ответ Claude: %s", fullText)
 
 	// Парсинг JSON
 	jsonStr := a.extractTaggedJSON(fullText)
 	if jsonStr != "" {
-		log.Printf("📥 [DEBUG] JSON найден: %s", jsonStr)
 		var m map[string]string
 		if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
-			_, err := a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, m["key"], m["value"], m["cat"])
-			if err != nil {
-				log.Printf("❌ [ERROR] DB INSERT FAILED: %v", err)
-			} else {
-				log.Printf("✅ [SUCCESS] Данные записаны в БД!")
-			}
-		} else {
-			log.Printf("❌ [ERROR] JSON UNMARSHAL: %v", err)
+			a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, m["key"], m["value"], m["cat"])
+			log.Printf("✅ Записано: %s", m["key"])
 		}
-	} else {
-		log.Printf("⚠️ [WARN] JSON не найден в ответе!")
 	}
 
+	// Очистка от мусора
 	cleanText := a.cleanResponse(fullText)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AgentResponse{Text: cleanText, Model: "claude-haiku-4-5"})
 }
