@@ -16,7 +16,6 @@ import (
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
-// Твои вопросы
 var regQuestions = []string{
 	"Йо! Я Джарвис, твой новый цифровой бро. Рад, что ты меня подрубил. Чтобы я не был просто железкой, давай познакомимся по-человечески. Как тебя величать и сколько тебе лет?",
 	"Живем в мире, где всё перемешано. На каких языках тебе комфортнее штурмовать этот мир? Русский, английский, иврит — пиши, на чем удобно, я пойму всё.",
@@ -43,7 +42,7 @@ func main() {
 
 	db, err := sql.Open("postgres", dbUrl)
 	if err != nil {
-		log.Fatal("Ошибка подключения к БД:", err)
+		log.Fatal("Ошибка БД:", err)
 	}
 
 	agent := &Agent{
@@ -58,35 +57,39 @@ func main() {
 
 func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	msg := r.FormValue("message")
-	userID, _ := strconv.Atoi(r.FormValue("user_id"))
+	uid, _ := strconv.Atoi(r.FormValue("user_id"))
 	sessionID, _ := strconv.Atoi(r.FormValue("session_id"))
-	uidStr := strconv.Itoa(userID)
+	uidStr := strconv.Itoa(uid)
 
-	// Сохраняем входящее сообщение
-	a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3)", userID, sessionID, msg)
+	// 1. Сохраняем сообщение с использованием sessionID
+	a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3)", uid, sessionID, msg)
 
-	// 1. Управление логикой
+	// 2. Управление логикой
 	memCount := a.getMemCount(uidStr)
 	var systemPrompt string
+
+	// Правило бюджета токенов вшито прямо в строку
+	tokenBudget := "\nПРАВИЛО БЮДЖЕТА: Если запрос простой (факты, справки) — отвечай кратко (1-2 строки). Если вопрос сложный (бизнес-стратегия, архитектура) — отвечай подробно."
 
 	if memCount < len(regQuestions) {
 		// FLOW: Регистрация
 		systemPrompt = fmt.Sprintf("Ты Джарвис. Идет регистрация (%d/%d). Вопрос: %s. Если пользователь ответил, извлеки факт и сохрани в JSON: {\"key\": \"...\", \"value\": \"...\", \"cat\": \"profile\"}.", memCount+1, len(regQuestions), regQuestions[memCount])
 	} else if msg == "/new chat" {
 		// FLOW: Новый чат
-		systemPrompt = "Ты Джарвис. Пользователь начал новый чат. Задай настройки стиля, цели и особенностей (как в Википедии или кратко). Извлеки ответы в JSON: {\"key\": \"style/goal/features\", \"value\": \"...\", \"cat\": \"session\"}."
+		systemPrompt = "Ты Джарвис. Новый чат. Задай настройки стиля, цели. Извлеки JSON: {\"key\": \"style/goal/features\", \"value\": \"...\", \"cat\": \"session\"}."
 	} else {
 		// FLOW: Нормальное общение
 		profile := a.getMemories(uidStr)
-		systemPrompt = fmt.Sprintf("Ты Джарвис. Профиль пользователя: %s. Твоя задача: отвечать в стиле, заданном пользователем, используя IT-сленг если нужно. СТРОГИЙ HTML.", profile)
+		systemPrompt = fmt.Sprintf("Ты Джарвис. Профиль: %s. Твоя задача: отвечать в стиле, заданном пользователем, используя IT-сленг если нужно. СТРОГИЙ HTML. %s", profile, tokenBudget)
 	}
 
-	// 2. Отправка в Claude
+	// 3. Отправка в Claude
 	model := "claude-haiku-4-5"
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
-		Model:    anthropic.Model(model),
-		System:   systemPrompt,
-		Messages: []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(msg)}}},
+		Model:     anthropic.Model(model),
+		MaxTokens: 2048,
+		System:    systemPrompt,
+		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(msg)}}},
 	})
 
 	if err != nil {
@@ -97,7 +100,7 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	responseText := resp.Content[0].GetText()
 
-	// 3. Парсинг и сохранение
+	// 4. Парсинг и сохранение
 	if jsonStr := a.extractJSON(responseText); jsonStr != "" {
 		var m map[string]string
 		if err := json.Unmarshal([]byte(jsonStr), &m); err == nil {
@@ -105,8 +108,8 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 4. Сохранение ответа и возврат
-	a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'assistant', $3)", userID, sessionID, responseText)
+	// 5. Ответ
+	a.db.Exec("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'assistant', $3)", uid, sessionID, responseText)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AgentResponse{Text: responseText, Model: model})
 }
