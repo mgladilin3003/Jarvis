@@ -232,12 +232,28 @@ func (a *Agent) handleAnalyzeFile(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("DEBUG: Текст извлечен, размер: %d символов", len(text))
 
-	// 3. Отправляем в Claude
+	// 3. Формируем "строгий" промпт для Claude
+	prompt := fmt.Sprintf(`Проанализируй этот текст и выдели суть.
+
+ВАЖНЫЕ ПРАВИЛА ОФОРМЛЕНИЯ:
+1. НЕ используй Markdown (никаких решеток #, звездочек * или тире -).
+2. Используй ТОЛЬКО HTML-теги: <b> (жирный), <i> (курсив), <code> (моноширинный).
+3. НЕ используй таблицы (<table>) и заголовки (h1, h2).
+4. Вместо заголовков используй жирный шрифт с эмодзи: <b>🚀 Название</b>.
+5. Для списков используй эмодзи-маркеры (например, • или ✅).
+
+Текст для анализа:
+%s`, text)
+
+	// 4. Отправляем в Claude
 	log.Printf("DEBUG: Отправляю запрос в Claude...")
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
 		Model:     anthropic.Model("claude-haiku-4-5"),
 		MaxTokens: 1024,
-		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent("Проанализируй этот текст и выдели суть:\n\n" + text)}}},
+		Messages: []anthropic.Message{{
+			Role:    "user",
+			Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(prompt)},
+		}},
 	})
 
 	if err != nil {
