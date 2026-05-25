@@ -16,7 +16,6 @@ import (
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
-// ТЕ САМЫЕ ВОПРОСЫ ИЗ ТВОЕГО ПЛАНА (Слово в слово)
 var regQuestions = []string{
 	"Йо! Я Джарвис, твой новый цифровой бро. Рад, что ты меня подрубил. Чтобы я не был просто железкой, давай познакомимся по-человечески. Как тебя величать и сколько тебе лет (хотя в душе мы все дети, но мне для понимания)?",
 	"Живем в мире, где всё перемешано. На каких языках тебе комфортнее штурмовать этот мир? Русский, английский, иврит — пиши, на чем удобно, я пойму всё.",
@@ -53,7 +52,10 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	uid := r.FormValue("user_id")
 	sid := r.FormValue("session_id")
 
-	// 1. Запись сообщения пользователя
+	// 0. ПОЛУЧАЕМ ИСТОРИЮ ДИАЛОГА (Контекст)
+	chatHistory := a.getChatHistory(uid, sid)
+
+	// 1. Запись текущего сообщения пользователя
 	var userMessageID int64
 	err := a.db.QueryRow("INSERT INTO messages (user_id, session_id, role, content) VALUES ($1, $2, 'user', $3) RETURNING id",
 		uid, sid, msg).Scan(&userMessageID)
@@ -66,34 +68,45 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	var systemPrompt string
 	if memCount < len(regQuestions) {
-
-		// Собираем список вопросов с их номерами
 		var questionsStr string
 		for i, q := range regQuestions {
 			questionsStr += fmt.Sprintf("%d. %s\n", i+1, q)
 		}
 
-		systemPrompt = fmt.Sprintf(`Ты Джарвис, твой новый цифровой бро. Идет процесс знакомства (регистрация).
-    
-    Список всех вопросов для знакомства:
-    %s
-    
-    Уже известно о пользователе (база фактов): 
-    [%s]
-    
-    ИНСТРУКЦИЯ К ДЕЙСТВИЮ:
-    1. Если пользователь ответил на твой вопрос, отреагируй на его ответ в своем фирменном стиле.
-    2. В ЭТОМ ЖЕ СООБЩЕНИИ СРАЗУ задай СЛЕДУЮЩИЙ вопрос из списка. Задавай его СЛОВО В СЛОВО, как написано в списке выше! НЕ ПРИДУМЫВАЙ ОТСЕБЯТИНУ!
-    3. КРИТИЧЕСКИ ВАЖНО: В самом конце своего ответа (с новой строки) добавь разделитель ---JSON--- и после него напиши валидный JSON: {"key":"short_english_key","value":"ответ пользователя","cat":"profile"}.
-    4. ЗАПРЕЩЕНО использовать Markdown-форматирование (никаких звездочек **, решеток #). Пиши только обычным текстом.`, questionsStr, memories)
+		systemPrompt = fmt.Sprintf(`Ты Джарвис, цифровой бро. Идет регистрация.
+        
+История текущего диалога (для понимания контекста):
+%s
+
+Список вопросов для регистрации:
+%s
+
+База известных фактов: [%s]
+
+ЖЕСТКИЕ ПРАВИЛА:
+1. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать Markdown (**звездочки**). Это ломает бота! Для выделения эмоций используй ЭМОДЗИ (🚀😎🔥) или ЗАГЛАВНЫЕ БУКВЫ.
+2. НЕ ЗДОРОВАЙСЯ в каждом сообщении. Поздоровался один раз — и хватит.
+3. НЕ ПОВТОРЯЙ факты о пользователе (имя, хобби), если это не нужно прямо сейчас. Общайся естественно.
+4. Отреагируй на ответ пользователя и СРАЗУ (в этом же сообщении) задай следующий вопрос из списка. Вопрос копируй СЛОВО В СЛОВО без отсебятины.
+5. Если получена новая инфа о пользователе, в самом конце добавь разделитель ---JSON--- и JSON: {"key":"...","value":"...","cat":"profile"}.`, chatHistory, questionsStr, memories)
+
 	} else {
-		systemPrompt = fmt.Sprintf(`Ты Джарвис, цифровой напарник. Ты знаешь о пользователе: [%s]. 
-        Общайся свободно. ЗАПРЕЩЕНО использовать Markdown (никаких звездочек **, решеток #). Пиши обычным текстом.`, memories)
+		systemPrompt = fmt.Sprintf(`Ты Джарвис, цифровой напарник. 
+
+История текущего диалога (память):
+%s
+
+База известных фактов: [%s]
+
+ЖЕСТКИЕ ПРАВИЛА:
+1. НИКАКИХ ЗВЕЗДОЧЕК (**) и Markdown-разметки! Используй только текст, ЗАГЛАВНЫЕ БУКВЫ и ЭМОДЗИ (😎🤖💡).
+2. Не здоровайся в каждом сообщении. Мы уже общаемся.
+3. Упоминай факты о пользователе только если это уместно в контексте беседы. Не веди себя как робот-автоответчик.`, chatHistory, memories)
 	}
 
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
 		Model:     anthropic.Model("claude-haiku-4-5"),
-		MaxTokens: 1024,
+		MaxTokens: 2048,
 		System:    systemPrompt,
 		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(msg)}}},
 	})
@@ -104,14 +117,12 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Обновление токенов пользователя (Input)
 	if userMessageID != 0 {
 		a.db.Exec("UPDATE messages SET tokens_used = $1 WHERE id = $2", resp.Usage.InputTokens, userMessageID)
 	}
 
 	fullText := resp.Content[0].GetText()
 
-	// 3. Парсинг данных
 	var cleanText string
 	if strings.Contains(fullText, "---JSON---") {
 		parts := strings.Split(fullText, "---JSON---")
@@ -125,16 +136,12 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 			var m map[string]string
 			if err := json.Unmarshal([]byte(match), &m); err == nil {
 				a.db.Exec("INSERT INTO memories (user_id, fact_key, fact_value, fact_category) VALUES ($1, $2, $3, $4)", uid, m["key"], m["value"], m["cat"])
-				log.Printf("✅ Записано в БД: %s", m["key"])
-			} else {
-				log.Printf("❌ Ошибка парсинга JSON: %v", err)
 			}
 		}
 	} else {
 		cleanText = fullText
 	}
 
-	// 4. Очистка от маркдауна и запись ответа бота
 	finalText := a.cleanTrash(cleanText)
 	a.db.Exec(`INSERT INTO messages (user_id, session_id, role, content, tokens_used) VALUES ($1, $2, 'assistant', $3, $4)`,
 		uid, sid, finalText, resp.Usage.OutputTokens)
@@ -143,12 +150,39 @@ func (a *Agent) handleChat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(AgentResponse{Text: finalText, Model: "claude-haiku-4-5"})
 }
 
+// Достаем последние 10 сообщений, чтобы Джарвис понимал контекст
+func (a *Agent) getChatHistory(uid, sid string) string {
+	rows, err := a.db.Query(`
+		SELECT role, content FROM (
+			SELECT id, role, content FROM messages 
+			WHERE user_id = $1 AND session_id = $2 
+			ORDER BY id DESC LIMIT 10
+		) sub ORDER BY id ASC
+	`, uid, sid)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var role, content string
+		rows.Scan(&role, &content)
+		if role == "user" {
+			sb.WriteString("User: " + content + "\n")
+		} else {
+			sb.WriteString("Jarvis: " + content + "\n")
+		}
+	}
+	return sb.String()
+}
+
 func (a *Agent) cleanTrash(text string) string {
 	reTags := regexp.MustCompile(`(?i)\[JSON\].*?\[/JSON\]`)
 	text = reTags.ReplaceAllString(text, "")
 	text = strings.ReplaceAll(text, "---JSON---", "")
 
-	// ЖЕСТКО удаляем маркдаун
+	// Вырезаем маркдаун
 	text = strings.ReplaceAll(text, "**", "")
 	text = strings.ReplaceAll(text, "*", "")
 	text = strings.ReplaceAll(text, "###", "")
