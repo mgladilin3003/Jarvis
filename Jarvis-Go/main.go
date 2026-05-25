@@ -8,8 +8,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/ledongthuc/pdf" // Новая библиотека
 
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -204,4 +207,82 @@ func (a *Agent) getChatHistory(uid, sid string) string {
 		sb.WriteString(r + ": " + c + "\n")
 	}
 	return sb.String()
+}
+
+func (a *Agent) handleAnalyzeFile(w http.ResponseWriter, r *http.Request) {
+	filePath := r.FormValue("file_path") // Путь к файлу, который сохранил Java-бот
+
+	// 1. Извлекаем текст
+	text, err := a.extractTextFromFile(filePath)
+	if err != nil {
+		http.Error(w, "Ошибка парсинга файла: "+err.Error(), 500)
+		return
+	}
+
+	// 2. Отправляем в Claude для анализа
+	prompt := "Проанализируй этот текст/документ и выдели главную суть, сделай краткое резюме:\n\n" + text
+
+	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
+		Model:     anthropic.Model("claude-haiku-4-5"),
+		MaxTokens: 1024,
+		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(prompt)}}},
+	})
+
+	if err != nil {
+		http.Error(w, "Ошибка Claude", 500)
+		return
+	}
+
+	// 3. Возвращаем результат
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AgentResponse{Text: resp.Content[0].GetText(), Model: "claude-haiku-4-5"})
+}
+
+func (a *Agent) extractTextFromFile(path string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	if ext == ".pdf" {
+		// 1. Открываем файл как обычный системный файл
+		f, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("ошибка открытия файла: %v", err)
+		}
+		defer f.Close()
+
+		// 2. Получаем размер файла
+		fi, err := f.Stat()
+		if err != nil {
+			return "", err
+		}
+		size := fi.Size()
+
+		// 3. Создаем ридер через конструктор библиотеки
+		// Это обходит проблемы с Open(), так как мы сами контролируем файл
+		reader, err := pdf.NewReader(f, size)
+		if err != nil {
+			return "", fmt.Errorf("ошибка чтения PDF: %v", err)
+		}
+
+		var totalText strings.Builder
+		for i := 1; i <= reader.NumPage(); i++ {
+			page := reader.Page(i)
+			if page.V.IsNull() {
+				continue
+			}
+			text, err := page.GetPlainText(nil)
+			if err != nil {
+				continue
+			}
+			totalText.WriteString(text)
+			totalText.WriteString("\n")
+		}
+		return totalText.String(), nil
+	}
+
+	// Для простых текстовых файлов
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }

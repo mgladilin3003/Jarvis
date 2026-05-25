@@ -8,3 +8,5 @@ require (
 )
 
 require github.com/lib/pq v1.12.3
+
+require github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
