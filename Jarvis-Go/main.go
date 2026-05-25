@@ -210,30 +210,41 @@ func (a *Agent) getChatHistory(uid, sid string) string {
 }
 
 func (a *Agent) handleAnalyzeFile(w http.ResponseWriter, r *http.Request) {
-	filePath := r.FormValue("file_path") // Путь к файлу, который сохранил Java-бот
+	filePath := r.FormValue("file_path")
+	log.Printf("DEBUG: Пришел запрос на анализ файла: %s", filePath)
 
-	// 1. Извлекаем текст
+	// 1. Проверяем, существует ли файл
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		log.Printf("ERROR: Файл не найден по пути: %s", filePath)
+		http.Error(w, "Файл не найден", 404)
+		return
+	}
+
+	// 2. Извлекаем текст
+	log.Printf("DEBUG: Пытаюсь извлечь текст из: %s", filePath)
 	text, err := a.extractTextFromFile(filePath)
 	if err != nil {
+		log.Printf("ERROR: Ошибка extractTextFromFile: %v", err)
 		http.Error(w, "Ошибка парсинга файла: "+err.Error(), 500)
 		return
 	}
+	log.Printf("DEBUG: Текст извлечен, размер: %d символов", len(text))
 
-	// 2. Отправляем в Claude для анализа
-	prompt := "Проанализируй этот текст/документ и выдели главную суть, сделай краткое резюме:\n\n" + text
-
+	// 3. Отправляем в Claude
+	log.Printf("DEBUG: Отправляю запрос в Claude...")
 	resp, err := a.claudeClient.CreateMessages(context.Background(), anthropic.MessagesRequest{
 		Model:     anthropic.Model("claude-haiku-4-5"),
 		MaxTokens: 1024,
-		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent(prompt)}}},
+		Messages:  []anthropic.Message{{Role: "user", Content: []anthropic.MessageContent{anthropic.NewTextMessageContent("Проанализируй этот текст и выдели суть:\n\n" + text)}}},
 	})
 
 	if err != nil {
-		http.Error(w, "Ошибка Claude", 500)
+		log.Printf("ERROR: Ошибка обращения к Claude: %v", err)
+		http.Error(w, "Ошибка Claude: "+err.Error(), 500)
 		return
 	}
 
-	// 3. Возвращаем результат
+	log.Printf("DEBUG: Получен ответ от Claude")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AgentResponse{Text: resp.Content[0].GetText(), Model: "claude-haiku-4-5"})
 }
