@@ -120,41 +120,47 @@ public class JarvisBot extends TelegramLongPollingBot {
     }
 
     private void handleDocument(Message message) {
-        long chatId = message.getChatId();
-        String fileId = message.getDocument().getFileId();
-        String fileName = message.getDocument().getFileName();
+    long chatId = message.getChatId();
+    String fileId = message.getDocument().getFileId();
+    String fileName = message.getDocument().getFileName();
+    
+    log.info("DEBUG: Получен файл: {} (ID: {})", fileName, fileId);
+    sendText(chatId, "📄 Файл принят, анализирую...");
+
+    try {
+        GetFile getFile = new GetFile();
+        getFile.setFileId(fileId);
+        org.telegram.telegrambots.meta.api.objects.File file = execute(getFile);
+
+        String localPath = System.getProperty("user.home") + "/jarvis_files/" + fileName;
+        downloadFile(file, new File(localPath));
+        log.info("DEBUG: Файл скачан локально: {}", localPath);
+
+        // --- ИСПРАВЛЕННЫЙ БЛОК URL ---
+        // Берем адрес без "/api/v1/chat", если он там был, и добавляем правильный путь
+        String baseUrl = goAgentUrl.replace("/api/v1/chat", "");
+        String safeUrl = baseUrl + "/api/v1/analyze_file";
+        log.info("DEBUG: Запрос на анализ летит по адресу: {}", safeUrl);
+        // ------------------------------
+
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add("file_path", localPath);
         
-        log.info("DEBUG: Получен файл: {} (ID: {})", fileName, fileId);
-        sendText(chatId, "📄 Файл принят, анализирую...");
-
-        try {
-            GetFile getFile = new GetFile();
-            getFile.setFileId(fileId);
-            org.telegram.telegrambots.meta.api.objects.File file = execute(getFile);
-
-            // Путь для сохранения на Малинке
-            String localPath = System.getProperty("user.home") + "/jarvis_files/" + fileName;
-            downloadFile(file, new File(localPath));
-            log.info("DEBUG: Файл скачан локально: {}", localPath);
-
-            MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
-            body.add("file_path", localPath);
-            
-            String safeUrl = (goAgentUrl != null) ? goAgentUrl + "/api/v1/analyze_file" : "http://localhost:8081/api/v1/analyze_file";
-            
-            AgentResponse response = restTemplate.postForObject(safeUrl, body, AgentResponse.class);
-            
-            if (response != null && response.text() != null) {
-                sendText(chatId, "✅ <b>Результат анализа:</b>\n" + response.text());
-            } else {
-                sendText(chatId, "⚠️ Файл обработан, но ответ пуст.");
-            }
-
-        } catch (Exception e) {
-            log.error("ERROR: Ошибка при обработке файла: ", e);
-            sendText(chatId, "❌ Ошибка при обработке файла: " + e.getMessage());
+        AgentResponse response = restTemplate.postForObject(safeUrl, body, AgentResponse.class);
+        
+        if (response != null && response.text() != null) {
+            sendText(chatId, "✅ <b>Результат анализа:</b>\n" + response.text());
+        } else {
+            sendText(chatId, "⚠️ Файл обработан, но ответ пуст.");
         }
+
+    } catch (Exception e) {
+        log.error("ERROR: Ошибка при обработке файла: ", e);
+        // --- ОЧИСТКА ТЕКСТА ОШИБКИ ---
+        String cleanError = e.getMessage().replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+        sendText(chatId, "❌ Ошибка при обработке файла: " + cleanError);
     }
+}
 
     private Integer getOrCreateActiveSession(int internalId) {
         String selectSql = "SELECT id FROM chat_sessions WHERE user_id = ? AND is_active = TRUE ORDER BY created_at DESC LIMIT 1";
